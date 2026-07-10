@@ -1,0 +1,18 @@
+[
+  { "task_id": "dev-fact-1", "category": "factual", "prompt": "What is the largest planet in the Solar System, and what is it mainly composed of?", "gold": ["jupiter", "hydrogen"] },
+  { "task_id": "dev-fact-2", "category": "factual", "prompt": "Which country has Manila as its capital, and on which continent is it located?", "gold": ["philippines", "asia"] },
+  { "task_id": "dev-math-1", "category": "math", "prompt": "A shirt costs 800 pesos and is discounted by 25%. What is the sale price? Then how much do 3 shirts cost at the sale price?", "gold": ["600", "1800"] },
+  { "task_id": "dev-math-2", "category": "math", "prompt": "A runner covers 42 kilometers in 4 hours. What is the average speed in km/h? How long would 63 km take at that speed?", "gold": ["10.5", "6"] },
+  { "task_id": "dev-sent-1", "category": "sentiment", "prompt": "Classify the sentiment of this review and justify briefly: The food was amazing but the service was painfully slow.", "gold": ["mixed"] },
+  { "task_id": "dev-sent-2", "category": "sentiment", "prompt": "Classify the sentiment of this message and justify briefly: I absolutely love this phone, best purchase I have made all year.", "gold": ["positive"] },
+  { "task_id": "dev-summ-1", "category": "summarization", "prompt": "Summarize the following in exactly one sentence: The city council debated the new bus rapid transit line for six hours, heard testimony from over forty residents, and ultimately voted 7 to 2 to approve construction beginning next January despite concerns about temporary lane closures.", "gold": ["approve", "bus"] },
+  { "task_id": "dev-summ-2", "category": "summarization", "prompt": "Summarize the following in one sentence of at most 20 words: Researchers trained a small language model on curated math data and found it outperformed models ten times its size on grade-school word problems, suggesting data quality can matter more than parameter count.", "gold": ["data", "small"] },
+  { "task_id": "dev-ner-1", "category": "ner", "prompt": "Extract all named entities and their types from: Elon Reyes visited Tokyo in January to meet Ana Cruz of Acme Corporation.", "gold": ["tokyo", "january", "ana cruz", "acme"] },
+  { "task_id": "dev-ner-2", "category": "ner", "prompt": "Extract all named entities and their types from: The World Health Organization opened a new office in Nairobi on 12 May 2024, led by Dr. Priya Nair.", "gold": ["nairobi", "world health organization", "priya nair"] },
+  { "task_id": "dev-dbg-1", "category": "code_debug", "prompt": "This function should add two numbers but has a bug: def add(a, b): return a - b. Find and fix it.", "gold": ["a + b"] },
+  { "task_id": "dev-dbg-2", "category": "code_debug", "prompt": "This function should return True when n is even but has a bug: def is_even(n): return n % 2 == 1. Find and fix it.", "gold": ["n % 2 == 0"] },
+  { "task_id": "dev-gen-1", "category": "code_gen", "prompt": "Write a Python function that reverses a string without using the built-in reversed function.", "gold": ["def "] },
+  { "task_id": "dev-gen-2", "category": "code_gen", "prompt": "Write a Python function fizzbuzz(n) that returns a list of strings for 1..n with the classic FizzBuzz rules.", "gold": ["def ", "fizz", "buzz"] },
+  { "task_id": "dev-logic-1", "category": "logic", "prompt": "Anna is taller than Ben. Ben is taller than Cy. Dee is shorter than Cy. Who is the shortest?", "gold": ["dee"] },
+  { "task_id": "dev-logic-2", "category": "logic", "prompt": "Three friends, Sam, Jo, and Lee, each own a different pet: cat, dog, bird. Sam does not own the bird. Jo owns the dog. Who owns the cat? Who owns the bird?", "gold": ["sam", "lee"] }
+]
