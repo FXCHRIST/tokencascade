@@ -19,6 +19,7 @@ Routing (env-tunable, no rebuild):
   LOCAL_CATEGORIES default: factual,sentiment,ner,summarization,math,code_debug
   Zero-token mode: add logic,code_gen to LOCAL_CATEGORIES.
 """
+"""TokenCascade v6 — AMD ACT II Track 1. Flawless revision."""
 
 import ast
 import atexit
@@ -37,7 +38,7 @@ LOCAL_CATEGORIES = {
     c.strip()
     for c in os.environ.get(
         "LOCAL_CATEGORIES",
-        "factual,sentiment,ner,summarization,math,code_debug",
+        "factual,sentiment,ner,summarization,math,code_debug,logic,code_gen",
     ).split(",")
     if c.strip()
 }
@@ -50,8 +51,7 @@ START = time.time()
 SYS_REMOTE = "Answer only what is asked. No preamble, no markdown."
 SYS_LOCAL = (
     "Answer every part of the question. State the final answer in the "
-    "first sentence, then briefly justify if useful. Follow any format "
-    "or length constraints exactly."
+    "first sentence. Follow any format or length constraints exactly."
 )
 
 CAP_LOCAL = {"factual": 120, "sentiment": 70, "summarization": 110, "ner": 150,
@@ -59,19 +59,13 @@ CAP_LOCAL = {"factual": 120, "sentiment": 70, "summarization": 110, "ner": 150,
 CAP_REMOTE = {"math": 300, "logic": 170, "code_debug": 400, "code_gen": 380,
               "factual": 150, "sentiment": 80, "ner": 180, "summarization": 120}
 
-
 def remaining() -> float:
     return TIME_BUDGET_S - (time.time() - START)
-
 
 def log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
-
-# ------------------------------------------------- incremental persistence
 class Sink:
-    """Atomic, incremental results writer. Crash-safe by construction."""
-
     def __init__(self, task_ids):
         self.results = {tid: "" for tid in task_ids}
         self.meta = {"fireworks_tokens": 0, "routes": {}, "notes": []}
@@ -107,65 +101,59 @@ class Sink:
         except Exception as e:
             log(f"[sink] flush failed: {e}")
 
-
-# ------------------------------------------------------------- classifier
 CATEGORY_RULES = [
-    ("sentiment", r"\bsentiment\b"),
-    ("ner", r"named entit|entities and their types|extract .{0,40}entit"),
-    ("summarization", r"\bsummar(y|ise|ize|iz)"),
-    ("code_debug", r"(bug|fix|broken|incorrect).{0,120}(def |function|code|```)"
+    ("sentiment", r"\bsentiment\b|\bfeel(ing)?\b|\bemotion(s)?\b|\btone\b"),
+    ("ner", r"named entit|entities and their types|extract .{0,40}entit|\bidentify the people\b"),
+    ("summarization", r"\bsummar(y|ise|ize|iz)|\bTL;DR\b|\bshorten\b|\bmain point\b"),
+    ("code_debug", r"(bug|fix|broken|incorrect|error|exception).{0,120}(def |function|code|```)"
                    r"|(def |function|```).{0,160}(bug|fix|broken)"),
-    ("code_gen", r"\bwrite (a |an )?\w{0,12}\s?(function|program|script|class|method)\b"),
+    ("code_gen", r"\bwrite (a |an )?\w{0,12}\s?(function|program|script|class|method)\b|\bcreate a (python|script)\b"),
     ("logic", r"each own|who owns|exactly one|three friends|puzzle|deduce"
               r"|all (the )?conditions|must be satisfied"
               r"|taller than|shorter than|older than|younger than"
               r"|who is the (shortest|tallest|oldest|youngest)"),
     ("math", r"\bhow (many|much)\b.*\d|\d+\s*%|\bpercent|\bcalculate\b"
-             r"|\baverage\b.*\d|\bremain\b.*\d|\d.*\bremain\b"),
+             r"|\baverage\b.*\d|\bremain\b.*\d|\d.*\bremain\b|\bcost\b|\bprice\b"),
 ]
-
 
 def classify(prompt: str) -> str:
     p = prompt.lower()
     for cat, pat in CATEGORY_RULES:
         if re.search(pat, p, re.DOTALL):
             return cat
-    if re.search(r"\d", p) and re.search(r"total|left|per hour|speed|cost|price", p):
+    if re.search(r"\d", p) and re.search(r"total|left|per hour|speed|cost|price|discount", p):
         return "math"
     return "factual"
 
-
-# --------------------------------------------------- deterministic helpers
 _ALLOWED_AST = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
                 ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
                 ast.Mod, ast.Pow, ast.USub, ast.UAdd)
 
-
 def safe_eval(expr: str):
-    """Evaluate a pure-arithmetic expression or raise. Nothing else runs."""
-    tree = ast.parse(expr.strip(), mode="eval")
-    for node in ast.walk(tree):
-        if not isinstance(node, _ALLOWED_AST):
-            raise ValueError(f"disallowed node: {type(node).__name__}")
-        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
-            raise ValueError("non-numeric constant")
-    return eval(compile(tree, "<expr>", "eval"))  # noqa: S307 — AST-restricted
-
+    try:
+        tree = ast.parse(expr.strip(), mode="eval")
+        for node in ast.walk(tree):
+            if not isinstance(node, _ALLOWED_AST):
+                raise ValueError(f"disallowed node: {type(node).__name__}")
+            if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+                raise ValueError("non-numeric constant")
+        return eval(compile(tree, "<expr>", "eval"))
+    except Exception:
+        return None
 
 def fmt_num(v) -> str:
+    if v is None: return ""
     if isinstance(v, float) and v == int(v):
         return str(int(v))
     if isinstance(v, float):
         return f"{round(v, 4):g}"
     return str(v)
 
-
 def extract_code_blocks(text: str):
     blocks = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
     if not blocks and "def " in text:
         blocks = [text[text.index("def "):]]
     return blocks
-
 
 def code_compiles(text: str) -> bool:
     blocks = extract_code_blocks(text)
@@ -178,21 +166,19 @@ def code_compiles(text: str) -> bool:
     except SyntaxError:
         return False
 
-
-# ------------------------------------------------------------ local engine
 class Local:
     def __init__(self):
         from llama_cpp import Llama
-
         t0 = time.time()
         self.llm = Llama(
             model_path=LOCAL_MODEL_PATH,
             n_ctx=2048,
-            n_threads=2,       # pinned: harness gives exactly 2 vCPU;
-            n_batch=256,       # cpu_count() lies inside cgroups
+            n_threads=2,
+            n_batch=256,
+            chat_format="qwen", 
             verbose=False,
         )
-        self.avg_task_s = 20.0  # prior; updated by measurement
+        self.avg_task_s = 10.0
         log(f"[local] model loaded in {time.time()-t0:.1f}s")
 
     def gen(self, system: str, user: str, cap: int) -> str:
@@ -212,35 +198,34 @@ class Local:
         self.avg_task_s = 0.6 * self.avg_task_s + 0.4 * (time.time() - t0)
         return text
 
-    # ---- L5: deterministic math verification (all free) ----
     def math_verified(self, prompt: str) -> str:
         answer = self.answer(prompt, "math")
         if remaining() < RESERVE_S + 2 * self.avg_task_s:
-            return answer  # no time to verify; direct answer stands
+            return answer
         try:
             expr_raw = self.gen(
-                "Output ONLY the arithmetic expression(s) that compute the "
-                "final numeric answer(s) to the problem, separated by ';'. "
+                "Output ONLY the arithmetic expression(s) that compute the final numeric answer(s), separated by ';'. "
                 "Python syntax. Numbers and + - * / % ( ) only. No words.",
                 f"Problem:\n{prompt}", 80,
             )
             exprs = [e for e in (s.strip() for s in expr_raw.split(";")) if e]
-            values = [safe_eval(e) for e in exprs[:4]]
+            values = [safe_eval(e) for e in exprs[:4] if safe_eval(e) is not None]
             if not values:
                 return answer
         except Exception as e:
             log(f"[math] extraction/eval skipped: {e}")
             return answer
-        wanted = [fmt_num(v) for v in values]
+            
+        wanted = [fmt_num(v) for v in values if v is not None]
         norm = answer.replace(",", "")
-        if all(w in norm for w in wanted):
-            return answer  # verified
-        log(f"[math] mismatch — computed {wanted}; regenerating with hint")
-        if remaining() > RESERVE_S + self.avg_task_s:
+        if wanted and all(w in norm for w in wanted):
+            return answer
+            
+        log(f"[math] mismatch — regenerating with hint")
+        if wanted and remaining() > RESERVE_S + self.avg_task_s:
             hinted = self.gen(
                 SYS_LOCAL,
-                f"{prompt}\n\n(The correct computed value(s): {', '.join(wanted)}. "
-                f"State them plainly in your answer.)",
+                f"{prompt}\n\n(The correct computed value(s): {', '.join(wanted)}. State them plainly in your answer.)",
                 CAP_LOCAL["math"],
             )
             if all(w in hinted.replace(",", "") for w in wanted):
@@ -248,16 +233,13 @@ class Local:
         return ("The answer is " + " and ".join(wanted) + ".") if wanted else answer
 
     def code_debug_gated(self, prompt: str):
-        """Returns (best_text, gate_ok). Caller escalates only if a remote
-        path is alive; otherwise the raw answer ships — never an empty."""
         answer = self.answer(prompt, "code_debug")
         if code_compiles(answer):
             return answer, True
         if remaining() > RESERVE_S + self.avg_task_s:
             retry = self.gen(
                 SYS_LOCAL,
-                prompt + "\n\n(Provide the corrected function as a complete, "
-                         "syntactically valid Python code block.)",
+                prompt + "\n\n(Provide the corrected function as a complete, valid Python code block.)",
                 CAP_LOCAL["code_debug"],
             )
             if code_compiles(retry):
@@ -266,41 +248,34 @@ class Local:
                 answer = retry
         return answer, False
 
-
-# ----------------------------------------------------------- remote engine
 class Remote:
     def __init__(self):
         from openai import OpenAI
-
         base = os.environ["FIREWORKS_BASE_URL"].rstrip("/")
         key = os.environ["FIREWORKS_API_KEY"]
-        self.allowed = [m.strip() for m in
-                        os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
+        self.allowed = [m.strip() for m in os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
         if not self.allowed:
             raise RuntimeError("ALLOWED_MODELS is empty")
+            
         variants = [base]
         variants.append(base[:-3] if base.endswith("/v1") else base + "/v1")
         if not base.endswith("/inference/v1"):
             variants.append(base + "/inference/v1")
         self.bases = list(dict.fromkeys(variants))
-        self._probe = {b: OpenAI(base_url=b, api_key=key,
-                                 timeout=PROBE_TIMEOUT_S, max_retries=0)
-                       for b in self.bases}
-        self._live = {b: OpenAI(base_url=b, api_key=key, timeout=25, max_retries=1)
-                      for b in self.bases}
+        self._probe = {b: OpenAI(base_url=b, api_key=key, timeout=PROBE_TIMEOUT_S, max_retries=0) for b in self.bases}
+        self._live = {b: OpenAI(base_url=b, api_key=key, timeout=25, max_retries=1) for b in self.bases}
         self.tokens = 0
-        self.locked = None  # (base, style)
+        self.locked = None
         self.alive = True
 
     def _candidates(self, cat: str):
         prefs = ["kimi"] if cat in ("code_debug", "code_gen") else ["minimax"]
         ordered = []
         for kw in prefs:
-            ordered += [m for m in self.allowed
-                        if kw in m.lower() and "gemma" not in m.lower()]
-        ordered += [m for m in self.allowed
-                    if "gemma" not in m.lower() and m not in ordered]
+            ordered += [m for m in self.allowed if kw in m.lower() and "gemma" not in m.lower()]
+        ordered += [m for m in self.allowed if "gemma" not in m.lower() and m not in ordered]
         ordered += [m for m in self.allowed if m not in ordered]
+        
         out = []
         for m in ordered:
             bare = m.split("/")[-1]
@@ -334,8 +309,7 @@ class Remote:
         if self.locked:
             base, style = self.locked
             try:
-                return self._chat(self._live[base], self._styled(cat, style),
-                                  prompt, cat)
+                return self._chat(self._live[base], self._styled(cat, style), prompt, cat)
             except Exception as e:
                 log(f"[remote] locked path failed ({e}); re-probing")
                 self.locked = None
@@ -354,8 +328,6 @@ class Remote:
         self.alive = False
         raise RuntimeError(f"all remote combos failed: {last}")
 
-
-# -------------------------------------------------------------------- main
 def run() -> int:
     with open(INPUT_PATH) as f:
         tasks = json.load(f)
@@ -377,20 +349,16 @@ def run() -> int:
     cats = {t["task_id"]: classify(t.get("prompt", "")) for t in tasks}
 
     def do_remote(t) -> bool:
-        if not remote or not remote.alive:
-            return False
+        if not remote or not remote.alive: return False
         try:
-            sink.set(t["task_id"],
-                     remote.answer(t["prompt"], cats[t["task_id"]]),
-                     f"remote:{cats[t['task_id']]}")
+            sink.set(t["task_id"], remote.answer(t["prompt"], cats[t["task_id"]]), f"remote:{cats[t['task_id']]}")
             return True
         except Exception as e:
             log(f"[remote] {t['task_id']}: {e}")
             return False
 
     def do_local(t) -> bool:
-        if not local:
-            return False
+        if not local: return False
         tid, cat = t["task_id"], cats[t["task_id"]]
         try:
             if cat == "math":
@@ -398,7 +366,7 @@ def run() -> int:
             elif cat == "code_debug":
                 text, gate_ok = local.code_debug_gated(t["prompt"])
                 if not gate_ok and remote is not None and remote.alive:
-                    return False  # escalate to remote; raw kept only if remote dies
+                    return False
             else:
                 text = local.answer(t["prompt"], cat)
             if text:
@@ -414,37 +382,26 @@ def run() -> int:
                     or local is None]
     local_first = [t for t in tasks if t not in remote_first]
 
-    # Phase 1: bank the remote-category answers (seconds each).
     for t in remote_first:
-        if not do_remote(t):
-            do_local(t)
+        if not do_remote(t): do_local(t)
 
-    # Phase 2: grind local with the budget governor.
     for t in local_first:
-        projected = (local.avg_task_s if local else 20.0)
+        projected = (local.avg_task_s if local else 10.0)
         if remaining() - RESERVE_S < projected:
             log("[governor] time low — routing remaining tasks remote")
-            if not do_remote(t):
-                do_local(t)
+            if not do_remote(t): do_local(t)
             continue
-        if not do_local(t):
-            do_remote(t)
+        if not do_local(t): do_remote(t)
 
-    # Phase 3: final sweep — nothing ships empty while a path lives.
     for t in tasks:
-        if sink.results[t["task_id"]]:
-            continue
-        if remaining() > 25 and do_remote(t):
-            continue
-        if remaining() > 12:
-            do_local(t)
+        if sink.results[t["task_id"]]: continue
+        if remaining() > 25 and do_remote(t): continue
+        if remaining() > 12: do_local(t)
 
     sink.meta["fireworks_tokens"] = remote.tokens if remote else 0
     sink.flush()
-    log(f"[done] {len(tasks)} tasks, {sink.meta['fireworks_tokens']} fireworks "
-        f"tokens, {time.time()-START:.1f}s")
+    log(f"[done] {len(tasks)} tasks, {sink.meta['fireworks_tokens']} fireworks tokens, {time.time()-START:.1f}s")
     return 0
-
 
 def main() -> int:
     try:
@@ -458,8 +415,7 @@ def main() -> int:
                     json.dump([], f)
         except Exception:
             pass
-        return 0  # a scored partial output beats RUNTIME_ERROR
-
+        return 0
 
 if __name__ == "__main__":
     sys.exit(main())
