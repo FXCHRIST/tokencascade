@@ -194,10 +194,20 @@ class Local:
         return (out["choices"][0]["message"]["content"] or "").strip()
 
     def answer(self, prompt: str, cat: str) -> str:
-        t0 = time.time()
-        text = self.gen(SYS_LOCAL, prompt, CAP_LOCAL.get(cat, 140))
-        self.avg_task_s = 0.6 * self.avg_task_s + 0.4 * (time.time() - t0)
-        return text
+
+        injected_prompt = prompt
+        
+        if cat == "sentiment":
+            injected_prompt += "\n\nCRITICAL: Your reason MUST explicitly name the specific positive AND negative details mentioned in the text. Do not use generic phrases like 'both aspects'."
+        elif cat == "summarization":
+            injected_prompt += "\n\nCRITICAL: You must strictly obey the length constraints. If it asks for exactly two sentences, provide exactly two. If it asks for exactly three bullets, provide exactly three. COUNT THEM before answering."
+        elif cat == "ner":
+            injected_prompt += "\n\nCRITICAL: You must be exhaustively complete. Do not miss dates. Extract EVERY entity and apply the exact required labels without duplicating."
+        elif cat == "math":
+            injected_prompt += "\n\nCRITICAL: If the prompt asks multiple questions, you MUST provide the answers to all of them."
+
+        # Pass the heavily guarded prompt to the generator
+        return self.gen(SYS_LOCAL, injected_prompt, CAP_LOCAL.get(cat, 512))
 
     def math_verified(self, prompt: str) -> str:
         answer = self.answer(prompt, "math")
