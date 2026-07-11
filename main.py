@@ -38,7 +38,7 @@ LOCAL_CATEGORIES = {
     c.strip()
     for c in os.environ.get(
         "LOCAL_CATEGORIES",
-        "factual,sentiment,ner,summarization,math,code_debug,logic,code_gen",
+        "factual,sentiment,ner,summarization,math,code_debug",
     ).split(",")
     if c.strip()
 }
