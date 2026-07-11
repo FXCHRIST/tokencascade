@@ -52,6 +52,7 @@ LOCAL_MAX_PROMPT_CHARS = int(os.environ.get("LOCAL_MAX_PROMPT_CHARS", "1600"))
 START = time.time()
 
 SYS = "Answer directly and concisely."  # counts toward remote input tokens: keep tiny
+LOCAL_SYS = "Answer directly and concisely. Answer every part of the question."
 
 # Per-category output caps. WHY: remote completion tokens are the score;
 # local caps protect the 30s/request clock. Code needs room to be correct —
@@ -209,7 +210,7 @@ class Local:
     def _gen(self, prompt: str, cap: int) -> str:
         out = self.llm.create_chat_completion(
             messages=[
-                {"role": "system", "content": SYS},
+                {"role": "system", "content": LOCAL_SYS},
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
