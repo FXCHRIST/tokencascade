@@ -260,9 +260,15 @@ class Remote:
         if not self.allowed:
             raise RuntimeError("ALLOWED_MODELS is empty")
         
-        # FIXED: Removed broken path mutation logic that caused 404 errors.
-        # We trust the harness base URL directly.
-        self.bases = [base]
+        variants = [base]
+        if not base.endswith("/v1") and not base.endswith("/inference/v1"):
+            variants.append(base + "/v1")
+            variants.append(base + "/inference/v1")
+        elif base.endswith("/v1") and not base.endswith("/inference/v1"):
+
+            variants.append(base[:-3])
+            
+        self.bases = list(dict.fromkeys(variants))
         
         self._probe = {b: OpenAI(base_url=b, api_key=key,
                                  timeout=PROBE_TIMEOUT_S, max_retries=0)
@@ -270,7 +276,7 @@ class Remote:
         self._live = {b: OpenAI(base_url=b, api_key=key, timeout=25, max_retries=1)
                       for b in self.bases}
         self.tokens = 0
-        self.locked = None  # (base, style)
+        self.locked = None
         self.alive = True
 
     def _candidates(self, cat: str):
