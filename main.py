@@ -50,8 +50,9 @@ START = time.time()
 
 SYS_REMOTE = "Answer only what is asked. No preamble, no markdown."
 SYS_LOCAL = (
-    "Answer every part of the question. State the final answer in the "
-    "first sentence. Follow any format or length constraints exactly."
+    "Answer concisely and directly. Do NOT include introductory text, conversational "
+    "preambles, or markdown formatting blocks unless explicitly requested. State the "
+    "final answer or solution immediately."
 )
 
 CAP_LOCAL = {"factual": 120, "sentiment": 70, "summarization": 110, "ner": 150,
@@ -251,21 +252,25 @@ class Local:
 class Remote:
     def __init__(self):
         from openai import OpenAI
+
         base = os.environ["FIREWORKS_BASE_URL"].rstrip("/")
         key = os.environ["FIREWORKS_API_KEY"]
-        self.allowed = [m.strip() for m in os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
+        self.allowed = [m.strip() for m in
+                        os.environ.get("ALLOWED_MODELS", "").split(",") if m.strip()]
         if not self.allowed:
             raise RuntimeError("ALLOWED_MODELS is empty")
-            
-        variants = [base]
-        variants.append(base[:-3] if base.endswith("/v1") else base + "/v1")
-        if not base.endswith("/inference/v1"):
-            variants.append(base + "/inference/v1")
-        self.bases = list(dict.fromkeys(variants))
-        self._probe = {b: OpenAI(base_url=b, api_key=key, timeout=PROBE_TIMEOUT_S, max_retries=0) for b in self.bases}
-        self._live = {b: OpenAI(base_url=b, api_key=key, timeout=25, max_retries=1) for b in self.bases}
+        
+        # FIXED: Removed broken path mutation logic that caused 404 errors.
+        # We trust the harness base URL directly.
+        self.bases = [base]
+        
+        self._probe = {b: OpenAI(base_url=b, api_key=key,
+                                 timeout=PROBE_TIMEOUT_S, max_retries=0)
+                       for b in self.bases}
+        self._live = {b: OpenAI(base_url=b, api_key=key, timeout=25, max_retries=1)
+                      for b in self.bases}
         self.tokens = 0
-        self.locked = None
+        self.locked = None  # (base, style)
         self.alive = True
 
     def _candidates(self, cat: str):
