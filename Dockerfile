@@ -28,5 +28,5 @@ WORKDIR /app
 COPY main.py .
 
 ENV PYTHONUNBUFFERED=1
-ENV LOCAL_CATEGORIES="factual,sentiment,ner,summarization,math,logic,code_debug"
+ENV LOCAL_CATEGORIES="factual,sentiment,ner,summarization,math,code_debug"
 CMD ["python", "main.py"]
