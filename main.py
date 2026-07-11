@@ -235,18 +235,28 @@ class Local:
 
     def code_debug_gated(self, prompt: str):
         answer = self.answer(prompt, "code_debug")
-        if code_compiles(answer):
-            return answer, True
+        blocks = extract_code_blocks(answer)
+        
+        # FIXED: Extract and return ONLY the raw python block if it compiles
+        if blocks and code_compiles(answer):
+            return blocks[0].strip(), True
+            
         if remaining() > RESERVE_S + self.avg_task_s:
             retry = self.gen(
                 SYS_LOCAL,
                 prompt + "\n\n(Provide the corrected function as a complete, valid Python code block.)",
                 CAP_LOCAL["code_debug"],
             )
-            if code_compiles(retry):
-                return retry, True
+            r_blocks = extract_code_blocks(retry)
+            if r_blocks and code_compiles(retry):
+                return r_blocks[0].strip(), True
             if retry:
                 answer = retry
+                
+        # Fallback: Extract the first block even if compilation checks are risky
+        blocks = extract_code_blocks(answer)
+        if blocks:
+            return blocks[0].strip(), False
         return answer, False
 
 class Remote:
@@ -378,6 +388,11 @@ def run() -> int:
                 text, gate_ok = local.code_debug_gated(t["prompt"])
                 if not gate_ok and remote is not None and remote.alive:
                     return False
+            elif cat == "code_gen":
+                # FIXED: Strip markdown code wrappers out of code generation tasks
+                raw_text = local.answer(t["prompt"], cat)
+                blocks = extract_code_blocks(raw_text)
+                text = blocks[0].strip() if blocks else raw_text
             else:
                 text = local.answer(t["prompt"], cat)
             if text:
