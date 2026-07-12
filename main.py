@@ -128,8 +128,8 @@ CATEGORY_RULES = [
 ]
 
 def strip_think(text: str) -> str:
-    """Removes DeepSeek thinking blocks to isolate the final answer."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    """Removes both closed and unclosed DeepSeek thinking blocks."""
+    return re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL).strip()
 
 def classify(prompt: str) -> str:
     p = prompt.lower()
