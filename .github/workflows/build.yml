@@ -1,12 +1,76 @@
-# Free native linux/amd64 build + push to GitHub Container Registry.
-# Use this if your laptop is Apple Silicon or the build is slow locally.
-# Trigger: GitHub repo -> Actions -> "build-push" -> Run workflow.
+# CI/CD for TokenCascade.
+#
+# gate  — downloads the exact model the image will bundle and runs the full
+#         devset on 2 threads (harness-like CPU budget). Fails the run if
+#         accuracy or total runtime misses the thresholds, so a bad build
+#         can never reach the registry.
+# build — native linux/amd64 build + push to GHCR, only after gate passes.
+#
+# Trigger: repo -> Actions -> "build-push" -> Run workflow.
+#   tag: image tag to push (use "latest" ONLY when you intend to submit;
+#        never overwrite "latest" while a previous submission is unscored).
+#
 # After the first push: make the package PUBLIC (repo -> Packages ->
-# tokencascade -> Package settings -> Change visibility) or it will PULL_ERROR.
+# tokencascade -> Package settings -> Change visibility) or the judging
+# system will PULL_ERROR.
 name: build-push
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag to push (e.g. rc1, latest)"
+        required: true
+        default: "rc1"
+      skip_gate:
+        description: "Skip the devset gate (emergency only)"
+        required: false
+        default: "false"
+
+env:
+  MODEL_URL: https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen3-4B-Instruct-2507-Q4_K_M.gguf
+  MODEL_SHA256: 3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597
+
 jobs:
+  gate:
+    if: ${{ github.event.inputs.skip_gate != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pinned runtime
+        run: |
+          pip install --no-cache-dir -r requirements.txt \
+            --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+      - name: Cache model
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: model.gguf
+          key: gguf-${{ env.MODEL_SHA256 }}
+      - name: Download model
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fL --retry 3 --retry-delay 5 -o model.gguf "$MODEL_URL"
+      - name: Verify model integrity
+        run: echo "$MODEL_SHA256  model.gguf" | sha256sum -c -
+      - name: Run devset gate (2 threads, harness-like)
+        run: |
+          THREADS=2 LOCAL_MODEL_PATH=./model.gguf \
+          GATE_MIN_CORRECT=20 GATE_MAX_SECONDS=420 \
+          python devset/check.py
+      - name: Upload gate report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devset-report
+          path: devset_report.json
+          if-no-files-found: ignore
+
   build:
+    needs: [gate]
+    if: ${{ always() && (needs.gate.result == 'success' || github.event.inputs.skip_gate == 'true') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -24,4 +88,4 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/fxchrist/tokencascade:latest
+          tags: ghcr.io/fxchrist/tokencascade:${{ github.event.inputs.tag }}
