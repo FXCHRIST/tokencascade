@@ -55,8 +55,17 @@ SYS_LOCAL = (
     "final answer or solution immediately."
 )
 
-CAP_LOCAL = {"factual": 120, "sentiment": 70, "summarization": 110, "ner": 150,
-             "math": 200, "code_debug": 240, "logic": 160, "code_gen": 320}
+# Speed-optimized caps to prevent dual-core CPU generation timeouts
+CAP_LOCAL = {
+    "factual": 60,       # Dropped from 120
+    "sentiment": 40,     # Dropped from 70
+    "summarization": 60, # Dropped from 110
+    "ner": 90,           # Dropped from 150
+    "math": 80,          # Dropped from 200
+    "code_debug": 140,   # Dropped from 240
+    "logic": 60,         # Dropped from 160
+    "code_gen": 180      # Dropped from 320
+}
 CAP_REMOTE = {"math": 300, "logic": 170, "code_debug": 400, "code_gen": 380,
               "factual": 150, "sentiment": 80, "ner": 180, "summarization": 120}
 
@@ -173,10 +182,9 @@ class Local:
         t0 = time.time()
         self.llm = Llama(
             model_path=LOCAL_MODEL_PATH,
-            n_ctx=4096,           # Increased from 2048 for safer code gen
-            n_threads=2,
-            n_batch=256,
-            # chat_format="qwen", # REMOVE THIS LINE. Let the GGUF dictate the template.
+            n_ctx=2048,           # Reverted to 2048 to save prompt processing time
+            n_threads=3,          # Increased to 3 to maximize dual-core hardware capacity
+            n_batch=512,          # Increased from 256 for faster prompt parsing
             verbose=False,
         )
         self.avg_task_s = 10.0
