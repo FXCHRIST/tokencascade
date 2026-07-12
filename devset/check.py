@@ -126,6 +126,30 @@ def check_exec(answer, tests):
     return True, ""
 
 
+def check_near(answer, pairs):
+    """Each [a, b, window] pair must co-occur within `window` chars in the
+    answer's TAIL (last 250 chars) — the conclusion, not the restated
+    puzzle. Prevents keyword false-passes from echoed conditions."""
+    tail = answer[-250:].lower()
+    for a, b, window in pairs:
+        ia, ib = tail.find(a.lower()), tail.find(b.lower())
+        if ia < 0 or ib < 0 or abs(ia - ib) > window:
+            return False, f"'{a}'~'{b}' not concluded together"
+    return True, ""
+
+
+def check_order(answer, seq):
+    """Items must appear in this order within the answer's tail."""
+    tail = answer[-250:].lower()
+    pos = -1
+    for item in seq:
+        i = tail.find(item.lower(), pos + 1)
+        if i < 0:
+            return False, f"ordering broken at '{item}'"
+        pos = i
+    return True, ""
+
+
 def grade(task, answer):
     reasons = []
     ok = True
@@ -136,6 +160,16 @@ def grade(task, answer):
         if not k_ok:
             ok = False
             reasons.append(f"missing keywords: {missing}")
+    if "gold_near" in task:
+        n_ok, why = check_near(answer, task["gold_near"])
+        if not n_ok:
+            ok = False
+            reasons.append(why)
+    if "gold_order" in task:
+        o_ok, why = check_order(answer, task["gold_order"])
+        if not o_ok:
+            ok = False
+            reasons.append(why)
     if "forbid_label" in task:
         f_ok, why = check_forbid_label(answer, task["forbid_label"])
         if not f_ok:
