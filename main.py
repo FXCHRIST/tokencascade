@@ -56,15 +56,16 @@ SYS_LOCAL = (
 )
 
 # Speed-optimized caps to prevent dual-core CPU generation timeouts
+# Expanded caps to accommodate DeepSeek-R1's <think> phase without truncation
 CAP_LOCAL = {
-    "factual": 60,       # Dropped from 120
-    "sentiment": 40,     # Dropped from 70
-    "summarization": 60, # Dropped from 110
-    "ner": 90,           # Dropped from 150
-    "math": 80,          # Dropped from 200
-    "code_debug": 140,   # Dropped from 240
-    "logic": 60,         # Dropped from 160
-    "code_gen": 180      # Dropped from 320
+    "factual": 140,       
+    "sentiment": 140,     
+    "summarization": 160, 
+    "ner": 160,           
+    "math": 320,          # High cap to allow deep mathematical reasoning
+    "code_debug": 300,   
+    "logic": 280,         # High cap to allow step-by-step logic chains
+    "code_gen": 380       
 }
 CAP_REMOTE = {"math": 300, "logic": 170, "code_debug": 400, "code_gen": 380,
               "factual": 150, "sentiment": 80, "ner": 180, "summarization": 120}
@@ -126,6 +127,10 @@ CATEGORY_RULES = [
              r"|\baverage\b.*\d|\bremain\b.*\d|\d.*\bremain\b|\bcost\b|\bprice\b"),
 ]
 
+def strip_think(text: str) -> str:
+    """Removes DeepSeek thinking blocks to isolate the final answer."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
 def classify(prompt: str) -> str:
     p = prompt.lower()
     for cat, pat in CATEGORY_RULES:
@@ -182,9 +187,9 @@ class Local:
         t0 = time.time()
         self.llm = Llama(
             model_path=LOCAL_MODEL_PATH,
-            n_ctx=2048,           # Reverted to 2048 to save prompt processing time
-            n_threads=3,          # Increased to 3 to maximize dual-core hardware capacity
-            n_batch=512,          # Increased from 256 for faster prompt parsing
+            n_ctx=2048,           
+            n_threads=2,          # Changed from 3 to 2 to eliminate CPU contention
+            n_batch=512,          
             verbose=False,
         )
         self.avg_task_s = 10.0
@@ -205,20 +210,19 @@ class Local:
         injected_prompt = prompt
         
         if cat == "sentiment":
-            injected_prompt += "\n\nCRITICAL: Your reason MUST explicitly name the specific positive AND negative details mentioned in the text. Do not use generic phrases like 'both aspects'."
+            injected_prompt += "\n\nCRITICAL: After your internal reasoning, your final response MUST explicitly name the specific positive AND negative details mentioned."
         elif cat == "summarization":
-            injected_prompt += "\n\nCRITICAL: You must strictly obey the length constraints. If it asks for exactly two sentences, provide exactly two. If it asks for exactly one sentence, provide exactly one."
+            injected_prompt += "\n\nCRITICAL: After your internal reasoning, you must strictly obey the sentence length constraints."
         elif cat == "ner":
-            injected_prompt += "\n\nCRITICAL: You must be exhaustively complete. Extract EVERY entity and apply the exact required labels without duplicating."
+            injected_prompt += "\n\nCRITICAL: After your internal reasoning, extract EVERY entity with the exact required labels."
         elif cat == "math":
-            injected_prompt += "\n\nCRITICAL: If the prompt asks multiple questions, you MUST provide the answers to all of them."
+            injected_prompt += "\n\nCRITICAL: After your internal reasoning, make sure to explicitly provide the final answer values."
         elif cat == "factual":
-            injected_prompt += "\n\nCRITICAL: Name the specific entities requested directly and plainly."
+            injected_prompt += "\n\nCRITICAL: State the exact names or requested entities directly in your final conclusion."
         elif cat == "logic":
-            injected_prompt += "\n\nCRITICAL: State the exact names of the people or subjects requested in your final answer."
+            injected_prompt += "\n\nCRITICAL: State the exact names of the subjects requested in your final conclusion."
 
-        # Pass the heavily guarded prompt to the generator
-        return self.gen(SYS_LOCAL, injected_prompt, CAP_LOCAL.get(cat, 512))
+        return self.gen(SYS_LOCAL, injected_prompt, CAP_LOCAL.get(cat, 300))
 
     def math_verified(self, prompt: str) -> str:
         answer = self.answer(prompt, "math")
@@ -228,9 +232,11 @@ class Local:
             expr_raw = self.gen(
                 "Output ONLY the arithmetic expression(s) that compute the final numeric answer(s), separated by ';'. "
                 "Python syntax. Numbers and + - * / % ( ) only. No words.",
-                f"Problem:\n{prompt}", 80,
+                f"Problem:\n{prompt}", 120, # Increased cap slightly to allow safe thinking room
             )
-            exprs = [e for e in (s.strip() for s in expr_raw.split(";")) if e]
+            # STRIP THINK TAGS FIRST!
+            expr_clean = strip_think(expr_raw)
+            exprs = [e for e in (s.strip() for s in expr_clean.split(";")) if e]
             values = [safe_eval(e) for e in exprs[:4] if safe_eval(e) is not None]
             if not values:
                 return answer
