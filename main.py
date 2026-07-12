@@ -50,9 +50,9 @@ START = time.time()
 
 SYS_REMOTE = "Answer only what is asked. No preamble, no markdown."
 SYS_LOCAL = (
-    "Answer concisely and directly. Do NOT include introductory text, conversational "
-    "preambles, or markdown formatting blocks unless explicitly requested. State the "
-    "final answer or solution immediately."
+    "You are a concise assistant. Do NOT use a <think> block. Do NOT include internal reasoning. "
+    "Answer concisely and directly without any introductory text, preambles, or markdown formatting. "
+    "State the final answer immediately."
 )
 
 # Speed-optimized caps to prevent dual-core CPU generation timeouts
@@ -416,12 +416,14 @@ def run() -> int:
                 if not gate_ok and remote is not None and remote.alive:
                     return False
             elif cat == "code_gen":
-                # FIXED: Strip markdown code wrappers out of code generation tasks
                 raw_text = local.answer(t["prompt"], cat)
                 blocks = extract_code_blocks(raw_text)
                 text = blocks[0].strip() if blocks else raw_text
             else:
-                text = local.answer(t["prompt"], cat)
+                # FIX: Intercept standard categories and strip the think blocks!
+                raw_text = local.answer(t["prompt"], cat)
+                text = strip_think(raw_text)
+                
             if text:
                 sink.set(tid, text, f"local:{cat}")
                 return True
