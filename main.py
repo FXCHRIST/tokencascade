@@ -250,21 +250,49 @@ def parse_numbers(text):
     return out
 
 
+def last_final_span(text):
+    """Span of the LAST 'Final answer' marker — models sometimes front-load
+    a conclusion, spiral into self-doubt, then conclude again; the last
+    marker is the corrected one."""
+    spans = [m for m in re.finditer(r"final answer\s*:?", text, re.I)]
+    return spans[-1] if spans else None
+
+
+def cut_spiral(text):
+    """Amputate everything from the first self-doubt marker onward."""
+    m = MATH_SPIRAL.search(text)
+    return text[:m.start()].rstrip(" \n-\u2014,;") if m else text
+
+
 def final_numbers(text):
-    """Numbers stated on the model's own 'Final answer' line, if any."""
-    m = re.search(r"final answer\s*:?(.+)", text, re.I | re.DOTALL)
+    """Numbers stated after the model's LAST 'Final answer' marker."""
+    m = last_final_span(text)
     if not m:
         return []
-    return parse_numbers(m.group(1)[:160])
+    return parse_numbers(cut_spiral(text[m.end():])[:160])
+
+
+def after_last_final(text):
+    """Content after the LAST 'Final answer' marker, spiral-amputated."""
+    m = last_final_span(text)
+    if not m:
+        return ""
+    return cut_spiral(text[m.end():]).strip()
 
 
 def truncate_after_final(text):
-    """Cut everything after the end of the 'Final answer' line — removes
-    any post-answer rambling before it reaches the judge."""
-    m = re.search(r"final answer\s*:?[^\n]*", text, re.I)
-    if m:
-        return text[:m.end()].strip()
-    return text.strip()
+    """Judge-safe rendering: if the text contains self-doubt anywhere,
+    reduce it to a single clean 'Final answer' line (the LAST conclusion);
+    otherwise keep the working up to the end of the final-answer line."""
+    m = last_final_span(text)
+    if not m:
+        return cut_spiral(text).strip() or text.strip()
+    if MATH_SPIRAL.search(text):
+        tail = after_last_final(text).split("\n")[0].strip()
+        if tail:
+            return "Final answer: " + tail
+    end = text.find("\n", m.end())
+    return (text[:end] if end != -1 else text).strip()
 
 
 def num_close(a, b):
@@ -473,13 +501,14 @@ class Local:
         log(f"[local] model loaded in {time.time() - t0:.1f}s, "
             f"threads={THREADS}, ctx={N_CTX}")
 
-    def gen(self, user, cap, system=SYS_LOCAL):
+    def gen(self, user, cap, system=SYS_LOCAL, stop=None):
         out = self.llm.create_chat_completion(
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
             temperature=0,
             repeat_penalty=1.05,
             max_tokens=cap,
+            stop=stop,
         )
         choice = out["choices"][0]
         self.last_truncated = choice.get("finish_reason") == "length"
@@ -642,14 +671,13 @@ class Agent:
             prompt + "\n\nReason briefly (under 120 words), checking every "
             "condition, then end with 'Final answer:' followed by the "
             "complete assignment or ordering.", self._cap("logic"))
-        truncated = getattr(self.local, "last_truncated", False)
-        m = re.search(r"final answer\s*:\s*(.+)", ans, re.I | re.DOTALL)
-        if m and len(m.group(1).strip()) >= 10:
-            return m.group(1).strip()
+        conclusion = after_last_final(ans)
+        if len(conclusion) >= 10:
+            return conclusion
         # Reasoning ran past the cap before concluding — convert the partial
         # chain of thought into a clean one-line conclusion instead of
         # shipping a truncated ramble.
-        if (truncated or not m) and not self.fast:
+        if not self.fast:
             follow = self.local.gen(
                 "Puzzle:\n" + prompt + "\n\nReasoning so far:\n" + ans
                 + "\n\nState ONLY the final answer in one short line: the "
