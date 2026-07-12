@@ -58,14 +58,14 @@ SYS_LOCAL = (
 # Speed-optimized caps to prevent dual-core CPU generation timeouts
 # Expanded caps to accommodate DeepSeek-R1's <think> phase without truncation
 CAP_LOCAL = {
-    "factual": 140,       
-    "sentiment": 140,     
-    "summarization": 160, 
-    "ner": 160,           
-    "math": 320,          # High cap to allow deep mathematical reasoning
-    "code_debug": 300,   
-    "logic": 280,         # High cap to allow step-by-step logic chains
-    "code_gen": 380       
+    "factual": 400,       
+    "sentiment": 400,     
+    "summarization": 450, 
+    "ner": 450,           
+    "math": 500,          
+    "code_debug": 500,   
+    "logic": 500,         
+    "code_gen": 500       
 }
 CAP_REMOTE = {"math": 300, "logic": 170, "code_debug": 400, "code_gen": 380,
               "factual": 150, "sentiment": 80, "ner": 180, "summarization": 120}
@@ -410,17 +410,20 @@ def run() -> int:
         tid, cat = t["task_id"], cats[t["task_id"]]
         try:
             if cat == "math":
-                text = local.math_verified(t["prompt"])
+                # FIX: Strip thoughts from the math verification output!
+                raw_text = local.math_verified(t["prompt"])
+                text = strip_think(raw_text)
             elif cat == "code_debug":
-                text, gate_ok = local.code_debug_gated(t["prompt"])
+                raw_text, gate_ok = local.code_debug_gated(t["prompt"])
+                text = strip_think(raw_text)
                 if not gate_ok and remote is not None and remote.alive:
                     return False
             elif cat == "code_gen":
                 raw_text = local.answer(t["prompt"], cat)
-                blocks = extract_code_blocks(raw_text)
-                text = blocks[0].strip() if blocks else raw_text
+                text = strip_think(raw_text)
+                blocks = extract_code_blocks(text)
+                text = blocks[0].strip() if blocks else text
             else:
-                # FIX: Intercept standard categories and strip the think blocks!
                 raw_text = local.answer(t["prompt"], cat)
                 text = strip_think(raw_text)
                 
