@@ -1,0 +1,8 @@
+.DS_Store
+**/.DS_Store
+model.gguf
+*.gguf
+devset_report.json
+__pycache__/
+*.pyc
+.venv/
