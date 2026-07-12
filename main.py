@@ -58,14 +58,14 @@ SYS_LOCAL = (
 # Speed-optimized caps to prevent dual-core CPU generation timeouts
 # Expanded caps to accommodate DeepSeek-R1's <think> phase without truncation
 CAP_LOCAL = {
-    "factual": 400,       
-    "sentiment": 400,     
-    "summarization": 450, 
-    "ner": 450,           
-    "math": 500,          
-    "code_debug": 500,   
-    "logic": 500,         
-    "code_gen": 500       
+    "factual": 150,       
+    "sentiment": 150,     
+    "summarization": 200, 
+    "ner": 250,           
+    "math": 500,          # Keep high for the math_verified track
+    "code_debug": 400,   
+    "logic": 400,         
+    "code_gen": 400       
 }
 CAP_REMOTE = {"math": 300, "logic": 170, "code_debug": 400, "code_gen": 380,
               "factual": 150, "sentiment": 80, "ner": 180, "summarization": 120}
@@ -207,20 +207,24 @@ class Local:
         return (out["choices"][0]["message"]["content"] or "").strip()
 
     def answer(self, prompt: str, cat: str) -> str:
-        injected_prompt = prompt
+        # Force-inject an aggressive structural constraint directly to the prompt text
+        injected_prompt = (
+            "IMPORTANT: Do NOT use a <think> block. Do NOT think step-by-step. "
+            "Output your final answer immediately. Follow the task instructions directly.\n\n"
+            f"Task: {prompt}"
+        )
         
         if cat == "sentiment":
-            injected_prompt += "\n\nCRITICAL: After your internal reasoning, your final response MUST explicitly name the specific positive AND negative details mentioned."
+            injected_prompt += "\n\nCRITICAL: Your response MUST explicitly name the specific positive AND negative details mentioned."
         elif cat == "summarization":
-            injected_prompt += "\n\nCRITICAL: After your internal reasoning, you must strictly obey the sentence length constraints."
+            injected_prompt += "\n\nCRITICAL: You must strictly obey the sentence length constraints."
         elif cat == "ner":
-            injected_prompt += "\n\nCRITICAL: After your internal reasoning, extract EVERY entity with the exact required labels."
+            injected_prompt += "\n\nCRITICAL: Extract EVERY entity from the text and pair it with its label (e.g., Entity - LABEL). Do not just list the label names."
         elif cat == "math":
-            injected_prompt += "\n\nCRITICAL: After your internal reasoning, make sure to explicitly provide the final answer values."
+            # For math, we WANT it to think, so we override the restriction
+            injected_prompt = prompt + "\n\nCRITICAL: Provide the step-by-step math evaluation and state the final value."
         elif cat == "factual":
             injected_prompt += "\n\nCRITICAL: State the exact names or requested entities directly in your final conclusion."
-        elif cat == "logic":
-            injected_prompt += "\n\nCRITICAL: State the exact names of the subjects requested in your final conclusion."
 
         return self.gen(SYS_LOCAL, injected_prompt, CAP_LOCAL.get(cat, 300))
 
