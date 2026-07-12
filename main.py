@@ -19,6 +19,7 @@ Routing (env-tunable, no rebuild):
   LOCAL_CATEGORIES default: factual,sentiment,ner,summarization,math,code_debug
   Zero-token mode: add logic,code_gen to LOCAL_CATEGORIES.
 """
+#!/usr/bin/env python3
 """TokenCascade v6 — AMD ACT II Track 1. Flawless revision."""
 
 import ast
@@ -55,17 +56,15 @@ SYS_LOCAL = (
     "State the final answer immediately."
 )
 
-# Speed-optimized caps to prevent dual-core CPU generation timeouts
-# Expanded caps to accommodate DeepSeek-R1's <think> phase without truncation
 CAP_LOCAL = {
-    "factual": 150,       
-    "sentiment": 150,     
-    "summarization": 200, 
-    "ner": 250,           
-    "math": 500,          # Keep high for the math_verified track
-    "code_debug": 400,   
-    "logic": 400,         
-    "code_gen": 400       
+    "factual": 250,       
+    "sentiment": 250,     
+    "summarization": 300, 
+    "ner": 350,           
+    "math": 500,          
+    "code_debug": 450,   
+    "logic": 450,         
+    "code_gen": 450       
 }
 CAP_REMOTE = {"math": 300, "logic": 170, "code_debug": 400, "code_gen": 380,
               "factual": 150, "sentiment": 80, "ner": 180, "summarization": 120}
@@ -128,8 +127,14 @@ CATEGORY_RULES = [
 ]
 
 def strip_think(text: str) -> str:
-    """Removes both closed and unclosed DeepSeek thinking blocks."""
-    return re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.DOTALL).strip()
+    """Removes complete and unclosed thought blocks safely."""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if "<think>" in cleaned:
+        parts = cleaned.split("<think>", 1)
+        cleaned = parts[0].strip()
+        if not cleaned and len(parts) > 1:
+            cleaned = parts[1].replace("<think>", "").strip()
+    return cleaned if cleaned else text
 
 def classify(prompt: str) -> str:
     p = prompt.lower()
@@ -188,7 +193,7 @@ class Local:
         self.llm = Llama(
             model_path=LOCAL_MODEL_PATH,
             n_ctx=2048,           
-            n_threads=2,          # Changed from 3 to 2 to eliminate CPU contention
+            n_threads=2,          
             n_batch=512,          
             verbose=False,
         )
@@ -207,10 +212,8 @@ class Local:
         return (out["choices"][0]["message"]["content"] or "").strip()
 
     def answer(self, prompt: str, cat: str) -> str:
-        # Force-inject an aggressive structural constraint directly to the prompt text
         injected_prompt = (
-            "IMPORTANT: Do NOT use a <think> block. Do NOT think step-by-step. "
-            "Output your final answer immediately. Follow the task instructions directly.\n\n"
+            "IMPORTANT: Do NOT use a <think> block. Output your final answer directly.\n\n"
             f"Task: {prompt}"
         )
         
@@ -219,12 +222,11 @@ class Local:
         elif cat == "summarization":
             injected_prompt += "\n\nCRITICAL: You must strictly obey the sentence length constraints."
         elif cat == "ner":
-            injected_prompt += "\n\nCRITICAL: Extract EVERY entity from the text and pair it with its label (e.g., Entity - LABEL). Do not just list the label names."
+            injected_prompt += "\n\nCRITICAL: Extract EVERY entity from the text and format as Name - LABEL. Do not just list the label categories."
         elif cat == "math":
-            # For math, we WANT it to think, so we override the restriction
             injected_prompt = prompt + "\n\nCRITICAL: Provide the step-by-step math evaluation and state the final value."
         elif cat == "factual":
-            injected_prompt += "\n\nCRITICAL: State the exact names or requested entities directly in your final conclusion."
+            injected_prompt += "\n\nCRITICAL: State the exact names or requested entities directly."
 
         return self.gen(SYS_LOCAL, injected_prompt, CAP_LOCAL.get(cat, 300))
 
@@ -236,9 +238,8 @@ class Local:
             expr_raw = self.gen(
                 "Output ONLY the arithmetic expression(s) that compute the final numeric answer(s), separated by ';'. "
                 "Python syntax. Numbers and + - * / % ( ) only. No words.",
-                f"Problem:\n{prompt}", 120, # Increased cap slightly to allow safe thinking room
+                f"Problem:\n{prompt}", 120,
             )
-            # STRIP THINK TAGS FIRST!
             expr_clean = strip_think(expr_raw)
             exprs = [e for e in (s.strip() for s in expr_clean.split(";")) if e]
             values = [safe_eval(e) for e in exprs[:4] if safe_eval(e) is not None]
@@ -268,7 +269,6 @@ class Local:
         answer = self.answer(prompt, "code_debug")
         blocks = extract_code_blocks(answer)
         
-        # FIXED: Extract and return ONLY the raw python block if it compiles
         if blocks and code_compiles(answer):
             return blocks[0].strip(), True
             
@@ -284,7 +284,6 @@ class Local:
             if retry:
                 answer = retry
                 
-        # Fallback: Extract the first block even if compilation checks are risky
         blocks = extract_code_blocks(answer)
         if blocks:
             return blocks[0].strip(), False
@@ -306,7 +305,6 @@ class Remote:
             variants.append(base + "/v1")
             variants.append(base + "/inference/v1")
         elif base.endswith("/v1") and not base.endswith("/inference/v1"):
-
             variants.append(base[:-3])
             
         self.bases = list(dict.fromkeys(variants))
@@ -321,15 +319,8 @@ class Remote:
         self.alive = True
 
     def _candidates(self, cat: str):
-        prefs = ["kimi"] if cat in ("code_debug", "code_gen") else ["minimax"]
-        ordered = []
-        for kw in prefs:
-            ordered += [m for m in self.allowed if kw in m.lower() and "gemma" not in m.lower()]
-        ordered += [m for m in self.allowed if "gemma" not in m.lower() and m not in ordered]
-        ordered += [m for m in self.allowed if m not in ordered]
-        
         out = []
-        for m in ordered:
+        for m in self.allowed:
             bare = m.split("/")[-1]
             pref = m if m.startswith("accounts/") else f"accounts/fireworks/models/{bare}"
             for v in (m, pref, bare):
@@ -414,7 +405,6 @@ def run() -> int:
         tid, cat = t["task_id"], cats[t["task_id"]]
         try:
             if cat == "math":
-                # FIX: Strip thoughts from the math verification output!
                 raw_text = local.math_verified(t["prompt"])
                 text = strip_think(raw_text)
             elif cat == "code_debug":
