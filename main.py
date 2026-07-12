@@ -173,15 +173,15 @@ class Local:
         t0 = time.time()
         self.llm = Llama(
             model_path=LOCAL_MODEL_PATH,
-            n_ctx=2048,
+            n_ctx=4096,           # Increased from 2048 for safer code gen
             n_threads=2,
             n_batch=256,
-            chat_format="qwen", 
+            # chat_format="qwen", # REMOVE THIS LINE. Let the GGUF dictate the template.
             verbose=False,
         )
         self.avg_task_s = 10.0
         log(f"[local] model loaded in {time.time()-t0:.1f}s")
-
+      
     def gen(self, system: str, user: str, cap: int) -> str:
         out = self.llm.create_chat_completion(
             messages=[
@@ -194,17 +194,20 @@ class Local:
         return (out["choices"][0]["message"]["content"] or "").strip()
 
     def answer(self, prompt: str, cat: str) -> str:
-
         injected_prompt = prompt
         
         if cat == "sentiment":
             injected_prompt += "\n\nCRITICAL: Your reason MUST explicitly name the specific positive AND negative details mentioned in the text. Do not use generic phrases like 'both aspects'."
         elif cat == "summarization":
-            injected_prompt += "\n\nCRITICAL: You must strictly obey the length constraints. If it asks for exactly two sentences, provide exactly two. If it asks for exactly three bullets, provide exactly three. COUNT THEM before answering."
+            injected_prompt += "\n\nCRITICAL: You must strictly obey the length constraints. If it asks for exactly two sentences, provide exactly two. If it asks for exactly one sentence, provide exactly one."
         elif cat == "ner":
-            injected_prompt += "\n\nCRITICAL: You must be exhaustively complete. Do not miss dates. Extract EVERY entity and apply the exact required labels without duplicating."
+            injected_prompt += "\n\nCRITICAL: You must be exhaustively complete. Extract EVERY entity and apply the exact required labels without duplicating."
         elif cat == "math":
             injected_prompt += "\n\nCRITICAL: If the prompt asks multiple questions, you MUST provide the answers to all of them."
+        elif cat == "factual":
+            injected_prompt += "\n\nCRITICAL: Name the specific entities requested directly and plainly."
+        elif cat == "logic":
+            injected_prompt += "\n\nCRITICAL: State the exact names of the people or subjects requested in your final answer."
 
         # Pass the heavily guarded prompt to the generator
         return self.gen(SYS_LOCAL, injected_prompt, CAP_LOCAL.get(cat, 512))
