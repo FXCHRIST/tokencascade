@@ -49,20 +49,20 @@ MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "6000"))
 START = time.time()
 
 SYS_LOCAL = (
-    "You are a precise assistant. Answer directly with no preamble, no "
-    "self-reference, and no markdown headers. Follow every format "
-    "instruction in the task exactly."
+    "You are a precise assistant. Answer directly and concisely with no "
+    "preamble, no self-reference, and no markdown headers. Never write "
+    "more than the task requires. Follow every format instruction exactly."
 )
 
 # Generation caps per category (output tokens). Tokens are free locally;
 # these caps exist purely to protect the runtime budget.
 CAP = {
-    "factual": 220,
+    "factual": 200,
     "sentiment": 160,
     "summarization": 260,
     "ner": 260,
-    "math": 420,
-    "logic": 420,
+    "math": 380,
+    "logic": 380,
     "code_debug": 420,
     "code_gen": 420,
 }
@@ -236,6 +236,44 @@ def fmt_num(v):
 MATH_SPIRAL = re.compile(
     r"\bwait\b|doesn'?t match|does not match|expected answer"
     r"|something'?s wrong|let me recheck|that'?s not|\u274c", re.I)
+
+NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def parse_numbers(text):
+    out = []
+    for m in NUM_RE.findall(text or ""):
+        try:
+            out.append(float(m.replace(",", "")))
+        except ValueError:
+            pass
+    return out
+
+
+def final_numbers(text):
+    """Numbers stated on the model's own 'Final answer' line, if any."""
+    m = re.search(r"final answer\s*:?(.+)", text, re.I | re.DOTALL)
+    if not m:
+        return []
+    return parse_numbers(m.group(1)[:160])
+
+
+def truncate_after_final(text):
+    """Cut everything after the end of the 'Final answer' line — removes
+    any post-answer rambling before it reaches the judge."""
+    m = re.search(r"final answer\s*:?[^\n]*", text, re.I)
+    if m:
+        return text[:m.end()].strip()
+    return text.strip()
+
+
+def num_close(a, b):
+    return abs(a - b) <= max(1e-6, 1e-6 * max(abs(a), abs(b)))
+
+
+def nums_subset(small, big):
+    return bool(small) and all(any(num_close(s, b) for b in big)
+                               for s in small)
 
 NER_LINE = re.compile(
     r"^\s*[-*\u2022]?\s*(.+?)\s*[-\u2013:]\s*"
@@ -465,7 +503,7 @@ class Agent:
     def factual(self, prompt):
         return self.local.gen(
             prompt + "\n\nAnswer every part of the question directly and "
-            "completely.", self._cap("factual"))
+            "completely, in at most 4 sentences.", self._cap("factual"))
 
     def sentiment(self, prompt):
         ask = (prompt + "\n\nRules: reply with exactly one label "
@@ -529,11 +567,24 @@ class Agent:
 
     def math(self, prompt):
         ans = self.local.gen(
-            prompt + "\n\nShow the calculation briefly, then end with "
-            "'Final answer:' followed by the value(s).", self._cap("math"))
-        ans_truncated = getattr(self.local, "last_truncated", False)
+            prompt + "\n\nShow the calculation briefly (under 100 words), "
+            "then end with 'Final answer:' followed by the value(s).",
+            self._cap("math"))
+        ans_trunc = getattr(self.local, "last_truncated", False)
         if self.fast or remaining() < RESERVE_S + self.local.avg_task_s:
-            return ans
+            return truncate_after_final(ans)
+
+        def clean(text, truncated):
+            return ("final answer" in text.lower() and not truncated
+                    and not MATH_SPIRAL.search(text))
+
+        # Channel 1: the model's own step-by-step conclusion (empirically
+        # the most reliable channel for this model).
+        prose_vals = final_numbers(ans)
+
+        # Channel 2: a compressed arithmetic expression, computed by Python.
+        # This is a CROSS-CHECK, never the sole source of truth — compressed
+        # one-liners are where operator-precedence mistakes live.
         expr_raw = self.local.gen(
             f"Problem:\n{prompt}",
             120,
@@ -543,46 +594,71 @@ class Agent:
         pairs = [(e.strip(), safe_eval(e.strip()))
                  for e in expr_raw.split(";") if e.strip()]
         pairs = [(e, v) for e, v in pairs[:4] if v is not None]
-        if not pairs:
-            return ans
-        wanted = [fmt_num(v) for _, v in pairs]
+        expr_vals = [v for _, v in pairs]
 
-        def synthesize():
+        # Agreement: the prose conclusion matches the computed expression.
+        if prose_vals and expr_vals and nums_subset(prose_vals, expr_vals):
+            if clean(ans, ans_trunc):
+                return truncate_after_final(ans)
             lines = [f"{e} = {fmt_num(v)}" for e, v in pairs]
-            return "\n".join(lines) + "\nFinal answer: " + " and ".join(wanted)
+            return ("\n".join(lines) + "\nFinal answer: "
+                    + " and ".join(fmt_num(v) for v in prose_vals))
 
-        def clean(text, truncated):
-            low = text.lower()
-            return ("final answer" in low
-                    and not truncated
-                    and not MATH_SPIRAL.search(text))
+        # Disagreement (or a missing channel): independent tie-breaker with
+        # a structurally different prompt, then 2-of-3 majority.
+        log(f"[math] prose {prose_vals} vs expr {expr_vals} — tie-breaking")
+        tb = self.local.gen(
+            prompt + "\n\nRecompute carefully: write one operation per "
+            "line with its running result, then end with 'Final answer:' "
+            "followed by the value(s).", self._cap("math"))
+        tb_trunc = getattr(self.local, "last_truncated", False)
+        tb_vals = final_numbers(tb)
 
-        norm = ans.replace(",", "").replace("$", "")
-        if all(w in norm for w in wanted):
-            if clean(ans, ans_truncated):
-                return ans
-            log("[math] values verified but answer unclean/truncated — "
-                "synthesizing")
-            return synthesize()
-        log(f"[math] mismatch — model text vs computed {wanted}; regenerating")
-        hinted = self.local.gen(
-            prompt + f"\n\n(The correct computed value(s): "
-            f"{', '.join(wanted)}. Show brief working and state them "
-            "plainly, ending with 'Final answer:'.)", self._cap("math"))
-        h_trunc = getattr(self.local, "last_truncated", False)
-        if (all(w in hinted.replace(",", "").replace("$", "") for w in wanted)
-                and clean(hinted, h_trunc)):
-            return hinted
-        return synthesize()
+        candidates = [("prose", prose_vals, ans, ans_trunc),
+                      ("expr", expr_vals, None, False),
+                      ("tiebreak", tb_vals, tb, tb_trunc)]
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                a_name, a_vals, a_text, a_tr = candidates[i]
+                b_name, b_vals, b_text, b_tr = candidates[j]
+                if a_vals and b_vals and (nums_subset(a_vals, b_vals)
+                                          or nums_subset(b_vals, a_vals)):
+                    winner = a_vals if len(a_vals) >= len(b_vals) else b_vals
+                    log(f"[math] majority: {a_name}+{b_name} -> {winner}")
+                    for text, tr in ((a_text, a_tr), (b_text, b_tr)):
+                        if text and clean(text, tr):
+                            return truncate_after_final(text)
+                    return ("Final answer: "
+                            + " and ".join(fmt_num(v) for v in winner))
+        # No majority: trust the step-by-step channels over the expression.
+        log("[math] no majority — returning best prose channel")
+        for text, tr in ((tb, tb_trunc), (ans, ans_trunc)):
+            if text and clean(text, tr):
+                return truncate_after_final(text)
+        return truncate_after_final(tb or ans)
 
     def logic(self, prompt):
         ans = self.local.gen(
-            prompt + "\n\nReason step by step briefly, checking every "
-            "condition. End with 'Final answer:' followed by the complete "
-            "assignment or ordering.", self._cap("logic"))
+            prompt + "\n\nReason briefly (under 120 words), checking every "
+            "condition, then end with 'Final answer:' followed by the "
+            "complete assignment or ordering.", self._cap("logic"))
+        truncated = getattr(self.local, "last_truncated", False)
         m = re.search(r"final answer\s*:\s*(.+)", ans, re.I | re.DOTALL)
         if m and len(m.group(1).strip()) >= 10:
             return m.group(1).strip()
+        # Reasoning ran past the cap before concluding — convert the partial
+        # chain of thought into a clean one-line conclusion instead of
+        # shipping a truncated ramble.
+        if (truncated or not m) and not self.fast:
+            follow = self.local.gen(
+                "Puzzle:\n" + prompt + "\n\nReasoning so far:\n" + ans
+                + "\n\nState ONLY the final answer in one short line: the "
+                "complete assignment or ordering for every person. No "
+                "reasoning.", 90)
+            follow = re.sub(r"^final answer\s*:\s*", "", follow.strip(),
+                            flags=re.I)
+            if len(follow) >= 10:
+                return follow
         return ans
 
     def _code(self, prompt, cat, instruction):
