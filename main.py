@@ -233,6 +233,37 @@ def fmt_num(v):
     return str(v)
 
 
+MATH_SPIRAL = re.compile(
+    r"\bwait\b|doesn'?t match|does not match|expected answer"
+    r"|something'?s wrong|let me recheck|that'?s not|\u274c", re.I)
+
+NER_LINE = re.compile(
+    r"^\s*[-*\u2022]?\s*(.+?)\s*[-\u2013:]\s*"
+    r"(PERSON|ORGANIZATION|LOCATION|DATE)\s*$", re.I)
+
+
+def ner_filter(text):
+    """Keep only well-formed 'Entity - LABEL' lines; drop hallucinated
+    non-entities (lowercase phrases, over-long spans) and duplicates.
+    Falls back to the raw text if filtering would leave too little."""
+    keep, seen = [], set()
+    for ln in text.splitlines():
+        m = NER_LINE.match(ln.strip())
+        if not m:
+            continue
+        ent, label = m.group(1).strip(" .*-\u2022\"'"), m.group(2).upper()
+        if not ent or len(ent.split()) > 6:
+            continue
+        if label != "DATE" and not any(c.isupper() for c in ent):
+            continue
+        key = (ent.lower(), label)
+        if key in seen:
+            continue
+        seen.add(key)
+        keep.append(f"{ent} - {label}")
+    return "\n".join(keep) if len(keep) >= 2 else text
+
+
 def strip_think(text):
     """Safety net only — the bundled model is a non-thinking instruct model,
     but this keeps a model swap from ever leaking <think> blocks."""
@@ -399,6 +430,7 @@ class Local:
         # Warm-up primes caches so the first real task isn't penalised.
         self.llm.create_chat_completion(
             messages=[{"role": "user", "content": "Hi"}], max_tokens=1)
+        self.last_truncated = False
         self.avg_task_s = 15.0
         log(f"[local] model loaded in {time.time() - t0:.1f}s, "
             f"threads={THREADS}, ctx={N_CTX}")
@@ -411,8 +443,10 @@ class Local:
             repeat_penalty=1.05,
             max_tokens=cap,
         )
+        choice = out["choices"][0]
+        self.last_truncated = choice.get("finish_reason") == "length"
         return strip_think(
-            (out["choices"][0]["message"]["content"] or "").strip())
+            (choice["message"]["content"] or "").strip())
 
 
 # --------------------------------------------------------------------------
@@ -431,7 +465,7 @@ class Agent:
     def factual(self, prompt):
         return self.local.gen(
             prompt + "\n\nAnswer every part of the question directly and "
-            "name the exact entities or facts requested.", self._cap("factual"))
+            "completely.", self._cap("factual"))
 
     def sentiment(self, prompt):
         ask = (prompt + "\n\nRules: reply with exactly one label "
@@ -491,12 +525,13 @@ class Agent:
                 ask + "\n\nYour previous output was not in the required "
                 "'Entity - LABEL' line format. Redo it correctly.",
                 self._cap("ner"))
-        return ans
+        return ner_filter(ans)
 
     def math(self, prompt):
         ans = self.local.gen(
             prompt + "\n\nShow the calculation briefly, then end with "
             "'Final answer:' followed by the value(s).", self._cap("math"))
+        ans_truncated = getattr(self.local, "last_truncated", False)
         if self.fast or remaining() < RESERVE_S + self.local.avg_task_s:
             return ans
         expr_raw = self.local.gen(
@@ -505,22 +540,40 @@ class Agent:
             system=("Output ONLY the arithmetic expression(s) that compute "
                     "the final numeric answer(s), separated by ';'. Python "
                     "syntax, numbers and + - * / % ( ) only. No words."))
-        exprs = [e.strip() for e in expr_raw.split(";") if e.strip()]
-        values = [v for v in (safe_eval(e) for e in exprs[:4]) if v is not None]
-        if not values:
+        pairs = [(e.strip(), safe_eval(e.strip()))
+                 for e in expr_raw.split(";") if e.strip()]
+        pairs = [(e, v) for e, v in pairs[:4] if v is not None]
+        if not pairs:
             return ans
-        wanted = [fmt_num(v) for v in values]
+        wanted = [fmt_num(v) for _, v in pairs]
+
+        def synthesize():
+            lines = [f"{e} = {fmt_num(v)}" for e, v in pairs]
+            return "\n".join(lines) + "\nFinal answer: " + " and ".join(wanted)
+
+        def clean(text, truncated):
+            low = text.lower()
+            return ("final answer" in low
+                    and not truncated
+                    and not MATH_SPIRAL.search(text))
+
         norm = ans.replace(",", "").replace("$", "")
         if all(w in norm for w in wanted):
-            return ans
+            if clean(ans, ans_truncated):
+                return ans
+            log("[math] values verified but answer unclean/truncated — "
+                "synthesizing")
+            return synthesize()
         log(f"[math] mismatch — model text vs computed {wanted}; regenerating")
         hinted = self.local.gen(
             prompt + f"\n\n(The correct computed value(s): "
             f"{', '.join(wanted)}. Show brief working and state them "
             "plainly, ending with 'Final answer:'.)", self._cap("math"))
-        if all(w in hinted.replace(",", "").replace("$", "") for w in wanted):
+        h_trunc = getattr(self.local, "last_truncated", False)
+        if (all(w in hinted.replace(",", "").replace("$", "") for w in wanted)
+                and clean(hinted, h_trunc)):
             return hinted
-        return "Final answer: " + " and ".join(wanted)
+        return synthesize()
 
     def logic(self, prompt):
         ans = self.local.gen(
