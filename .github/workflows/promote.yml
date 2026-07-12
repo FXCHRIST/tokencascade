@@ -1,0 +1,48 @@
+# Promote a tested rc tag to :latest WITHOUT rebuilding.
+#
+# This is a registry-side manifest retag: :latest ends up pointing at the
+# EXACT same digest as the source tag — byte-identical by construction.
+# The job then proves it by comparing digests and fails on any mismatch.
+#
+# Usage: Actions -> "promote" -> Run workflow -> source_tag (e.g. rc4).
+# Only run this when you deliberately intend to submit.
+name: promote
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: "Tested tag to promote to latest (e.g. rc4)"
+        required: true
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Retag by digest
+        run: |
+          SRC="ghcr.io/fxchrist/tokencascade:${{ github.event.inputs.source_tag }}"
+          DST="ghcr.io/fxchrist/tokencascade:latest"
+          docker buildx imagetools create --tag "$DST" "$SRC"
+          S=$(docker buildx imagetools inspect "$SRC" | awk '/^Digest:/{print $2; exit}')
+          D=$(docker buildx imagetools inspect "$DST" | awk '/^Digest:/{print $2; exit}')
+          echo "source: $S"
+          echo "latest: $D"
+          if [ -n "$S" ] && [ "$S" = "$D" ]; then
+            echo "DIGESTS MATCH — latest is byte-identical to ${{ github.event.inputs.source_tag }}"
+          else
+            echo "DIGEST MISMATCH — do not submit"; exit 1
+          fi
+      - name: Verify anonymous pull (judge simulation)
+        run: |
+          docker logout ghcr.io
+          docker pull ghcr.io/fxchrist/tokencascade:latest
+          echo "ANONYMOUS PULL OK — the judging system can pull this image"
