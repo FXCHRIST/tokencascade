@@ -13,6 +13,10 @@ Scenario switches (env):
                            (repair must extract the array)
   SIM_SENT_BURIED=1        sentiment label buried mid-answer
                            (label surfacing must fire)
+  SIM_LOGIC_TRUNCATED=1    logic reasoning is cut off with no Answer line
+                           (conclude-salvage must recover it)
+  SIM_FACT_WRONG=1         factual answer swaps two terms; the review pass
+                           must flag it and the correction must ship
   SIM_SLOW_S=<seconds>     sleep per generation (governor testing)
   SIM_LOAD_FAIL=1          Llama() constructor raises (L3 fallback test)
 """
@@ -48,6 +52,14 @@ class Llama:
     # ------------------------------------------------------------------
     def _answer(self, system, user, temperature):
         s, u = system.lower(), user.lower()
+
+        # --- math: expression path ---
+        if "single python arithmetic expression" in s:
+            if "240 items" in u:
+                return "240 - 240*0.15 - 60"
+            if "2,400 units" in u or "2400 units" in u:
+                return "2400 - 2400*0.37 + 800 - 640"
+            return "42"
 
         # --- math: code path ---
         if "python script" in s and "print()" in s:
@@ -120,11 +132,27 @@ class Llama:
                     "with output flat and sick days down, recommended "
                     "adopting it permanently.")
 
+        # --- logic conclude salvage ---
+        if "reasoning" in s and "cut off" in s:
+            return "Answer: Sam owns the cat"
+
         # --- logic ---
         if "logic puzzle" in s or "puzzle" in s:
+            if os.environ.get("SIM_LOGIC_TRUNCATED") == "1" and "last line" not in s:
+                return ("Jo owns the dog. Sam does not own the bird, so Sam "
+                        "must own the cat. Checking each clue in turn: Jo has")
             return ("Jo owns the dog. Sam does not own the bird, so Sam owns "
                     "the cat and Lee owns the bird.\nAnswer: Sam owns the cat")
 
+        # --- factual review pass ---
+        if "review the answer" in s:
+            if os.environ.get("SIM_FACT_WRONG") == "1" and "tasman" in u:
+                return "The answer wrongly says Canberra is near the Tasman Sea."
+            return "OK"
+
         # --- factual ---
+        if os.environ.get("SIM_FACT_WRONG") == "1" and "reviewer identified" not in s:
+            return ("The capital of Australia is Canberra, located near the "
+                    "Tasman Sea.")
         return ("The capital of Australia is Canberra, located near Lake "
                 "Burley Griffin on the Molonglo River.")
