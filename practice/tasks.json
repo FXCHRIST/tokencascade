@@ -1,10 +1,10 @@
 [
-  {"task_id": "practice-01", "prompt": "What is the capital of Australia, and what is the name of the artificial lake at its center?"},
-  {"task_id": "practice-02", "prompt": "A store has 240 items. It sells 15% of them on Monday and 60 more on Tuesday. How many items are left after Tuesday?"},
-  {"task_id": "practice-03", "prompt": "Classify the sentiment of this review as Positive, Negative, or Neutral and give a one-sentence reason: 'The battery life is great, but the screen scratches far too easily.'"},
-  {"task_id": "practice-04", "prompt": "Summarize the following passage in exactly two sentences:\n'Public libraries have evolved beyond book lending into community hubs offering internet access, job-search assistance, and educational programs. Funding pressures, however, force many branches to cut hours and staff, raising concerns about equitable access to these services.'"},
-  {"task_id": "practice-05", "prompt": "Extract all named entities from the following text and label each as PERSON, ORGANIZATION, LOCATION, or DATE:\n'On May 9 2025, Jensen Huang spoke at Computex in Taipei about NVIDIA and its partnership with TSMC.'"},
-  {"task_id": "practice-06", "prompt": "Three colleagues - Ivy, Jun, and Kai - each drink exactly one beverage: coffee, tea, or juice. Ivy does not drink coffee. Jun's drink is caffeinated but is not coffee. Who drinks which beverage?"},
-  {"task_id": "practice-07", "prompt": "This Python function should return the largest number in a list, but it is wrong. Fix it:\n```python\ndef largest(nums):\n    best = 0\n    for n in nums:\n        if n > best:\n            best = n\n    return best\n```"},
-  {"task_id": "practice-08", "prompt": "Write a Python function count_vowels(s) that returns the number of vowels (a, e, i, o, u, case-insensitive) in the string s."}
+  { "task_id": "practice-01", "prompt": "What is the capital of Australia, and what body of water is it near?" },
+  { "task_id": "practice-02", "prompt": "A store has 240 items. It sells 15% on Monday and 60 more on Tuesday. How many items remain?" },
+  { "task_id": "practice-03", "prompt": "Classify the sentiment of this review: The battery life is great, but the screen scratches too easily." },
+  { "task_id": "practice-04", "prompt": "Summarize the following in exactly one sentence: The regional office spent three months piloting a four-day work week, found that output stayed flat while sick days dropped by a third, and has now recommended adopting the schedule permanently across all branches starting next quarter." },
+  { "task_id": "practice-05", "prompt": "Extract all named entities and their types from: Maria Sanchez joined Fireworks AI in Berlin last March." },
+  { "task_id": "practice-06", "prompt": "This function should return the max of a list but has a bug: def get_max(nums): return nums[0]. Find and fix it." },
+  { "task_id": "practice-07", "prompt": "Three friends, Sam, Jo, and Lee, each own a different pet: cat, dog, bird. Sam does not own the bird. Jo owns the dog. Who owns the cat?" },
+  { "task_id": "practice-08", "prompt": "Write a Python function that returns the second-largest number in a list, handling duplicates correctly." }
 ]
