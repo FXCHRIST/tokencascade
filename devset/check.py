@@ -1,271 +1,186 @@
 #!/usr/bin/env python3
-"""Devset runner and grader for TokenCascade.
+"""Devset gate for TokenCascade v6.
 
-Runs main.py as a subprocess against devset/tasks.json (exactly like the
-harness runs the container), then grades every answer four ways:
+Runs the REAL pipeline (main.py handlers + the actual GGUF model) against
+devset/tasks.json and grades every answer against the embedded spec:
 
-  1. gold keywords     — every keyword must appear (case-insensitive)
-  2. forbid_label      — the classification label must NOT be this value
-                         (checks the label word, not mere word presence)
-  3. format            — exact sentence count / exact bullet count /
-                         max words per bullet, mirroring the official
-                         T04/T04b pass rules
-  4. exec_tests        — code answers are executed and each [expr, expected]
-                         pair must evaluate to the expected value
-
-Keyword matching is stricter than the real LLM judge, so passing here is a
-good sign, not a guarantee.
+  require_all / require_any / require_any_2 / require_any_3
+        substrings that must appear (case-insensitive)
+  label_any / label_forbid_leading
+        sentiment label rules (label must appear early in the answer)
+  sentences / bullets / bullet_max_words / max_words
+        exact format constraints
+  numeric
+        the extracted final number must equal this value
+  answer_line_contains / answer_line_regex
+        checks against the text after 'Answer:'
+  code_test
+        the extracted code block is executed and the assertion (with `f`
+        bound to the defined function) must pass
 
 Usage:
-    LOCAL_MODEL_PATH=./model.gguf python devset/check.py
-    THREADS=2 LOCAL_MODEL_PATH=./model.gguf python devset/check.py   # CI
+  LOCAL_MODEL_PATH=./model.gguf python devset/check.py
+  THREADS=2 LOCAL_MODEL_PATH=./model.gguf \
+    GATE_MIN_CORRECT=20 GATE_MAX_SECONDS=420 python devset/check.py
 
-Gate (exit code 1 on failure):
-    GATE_MIN_CORRECT   default 20   (of 22)
-    GATE_MAX_SECONDS   default 420  (total wall time of the agent run)
+Exit code 0 iff correct >= GATE_MIN_CORRECT and runtime <= GATE_MAX_SECONDS.
+Writes devset_report.json either way.
 """
-
+import ast
 import json
 import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-GATE_MIN = int(os.environ.get("GATE_MIN_CORRECT", "20"))
-GATE_SEC = float(os.environ.get("GATE_MAX_SECONDS", "420"))
+sys.path.insert(0, ROOT)
+
+# The pipeline never touches Fireworks; give it a generous local budget so
+# the gate measures accuracy, and let GATE_MAX_SECONDS enforce time.
+os.environ.setdefault("TIME_BUDGET_S", "3600")
+
+import main as agent  # noqa: E402
 
 
-def split_sentences(text):
-    text = re.sub(r"\s+", " ", text).strip()
-    return [p.strip() for p in re.split(r"(?<=[.!?])\s+", text) if p.strip()]
+def _extract_code(answer: str) -> str:
+    return agent.extract_code(answer)
 
 
-def bullet_lines(text):
-    out = []
-    for ln in text.splitlines():
-        s = ln.strip()
-        if re.match(r"^([-*\u2022]|\d+[.)])\s+", s):
-            out.append(re.sub(r"^([-*\u2022]|\d+[.)])\s+", "", s).strip())
-    return out
+def _answer_line(answer: str) -> str:
+    m = re.search(r"answer:\s*(.+)$", answer, re.IGNORECASE | re.MULTILINE)
+    return m.group(1).strip() if m else answer.strip().splitlines()[-1] if answer.strip() else ""
 
 
-def extract_code(text):
-    blocks = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
-    if blocks:
-        return blocks[0].strip()
-    if "def " in text:
-        return text[text.index("def "):].strip()
-    return text.strip()
-
-
-def check_keywords(answer, gold):
-    low = answer.lower().replace(",", "")
-    missing = [k for k in gold if k.lower() not in low]
-    return (not missing), missing
-
-
-def check_forbid_label(answer, forbidden):
-    m = re.search(r"\b(positive|negative|neutral|mixed)\b", answer, re.I)
-    if not m:
-        return False, "no classification label found"
-    if m.group(1).lower() == forbidden.lower():
-        return False, f"label is {m.group(1)} (forbidden)"
-    return True, ""
-
-
-def check_format(answer, fmt):
-    if "exact_bullets" in fmt:
-        bl = bullet_lines(answer)
-        if len(bl) != fmt["exact_bullets"]:
-            return False, f"{len(bl)} bullets, need {fmt['exact_bullets']}"
-        k = fmt.get("max_words_per_bullet")
-        if k:
-            over = [b for b in bl if len(b.split()) > k]
-            if over:
-                return False, f"bullet over {k} words: '{over[0][:50]}...'"
-        return True, ""
-    if "exact_sentences" in fmt:
-        n = len(split_sentences(answer))
-        if n != fmt["exact_sentences"]:
-            return False, f"{n} sentences, need {fmt['exact_sentences']}"
-    return True, ""
-
-
-def check_exec(answer, tests):
-    code = extract_code(answer)
-    harness = code + "\nimport json as _j\n_r = []\n"
-    for expr, _ in tests:
-        harness += (f"try:\n    _r.append(_j.dumps({expr}))\n"
-                    "except Exception as _e:\n"
-                    "    _r.append('ERROR: ' + str(_e))\n")
-    harness += "print(_j.dumps(_r))\n"
+def _run_code_test(answer: str, test: str, func_hint: str):
+    code = _extract_code(answer)
+    if not code:
+        return False, "no code block"
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return False, f"syntax error: {exc}"
+    funcs = [n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]
+    if not funcs:
+        return False, "no function defined"
+    target = next((n for n in funcs if func_hint in n.lower()), funcs[0])
+    harness = code + f"\nf = {target}\n" + test + "\nprint('CODE_TEST_PASS')"
     try:
         r = subprocess.run([sys.executable, "-c", harness],
-                           capture_output=True, text=True, timeout=15)
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0 and "CODE_TEST_PASS" in r.stdout:
+            return True, "pass"
+        return False, (r.stderr.strip().splitlines() or ["failed"])[-1]
     except subprocess.TimeoutExpired:
-        return False, "execution timed out"
-    if r.returncode != 0:
-        return False, (r.stderr or "crashed").strip().splitlines()[-1][:120]
-    try:
-        results = json.loads(r.stdout.strip().splitlines()[-1])
-    except Exception:
-        return False, "could not parse test output"
-    for (expr, expected), got in zip(tests, results):
-        if isinstance(got, str) and got.startswith("ERROR:"):
-            return False, f"{expr} -> {got[:100]}"
-        try:
-            got_val = json.loads(got)
-        except Exception:
-            got_val = got
-        if got_val != expected:
-            return False, f"{expr} -> {got_val!r}, expected {expected!r}"
-    return True, ""
+        return False, "timeout"
 
 
-def check_near(answer, pairs):
-    """Each [a, b, window] pair must co-occur within `window` chars in the
-    answer's TAIL (last 250 chars) — the conclusion, not the restated
-    puzzle. Prevents keyword false-passes from echoed conditions."""
-    tail = answer[-250:].lower()
-    for a, b, window in pairs:
-        ia, ib = tail.find(a.lower()), tail.find(b.lower())
-        if ia < 0 or ib < 0 or abs(ia - ib) > window:
-            return False, f"'{a}'~'{b}' not concluded together"
-    return True, ""
-
-
-def check_order(answer, seq):
-    """Items must appear in this order within the answer's tail."""
-    tail = answer[-250:].lower()
-    pos = -1
-    for item in seq:
-        i = tail.find(item.lower(), pos + 1)
-        if i < 0:
-            return False, f"ordering broken at '{item}'"
-        pos = i
-    return True, ""
-
-
-def grade(task, answer):
+def grade(answer: str, spec: dict):
+    low = (answer or "").lower()
     reasons = []
-    ok = True
-    if not answer.strip():
-        return False, ["empty answer"]
-    if "gold" in task:
-        k_ok, missing = check_keywords(answer, task["gold"])
-        if not k_ok:
-            ok = False
-            reasons.append(f"missing keywords: {missing}")
-    if "gold_near" in task:
-        n_ok, why = check_near(answer, task["gold_near"])
-        if not n_ok:
-            ok = False
-            reasons.append(why)
-    if "gold_order" in task:
-        o_ok, why = check_order(answer, task["gold_order"])
-        if not o_ok:
-            ok = False
-            reasons.append(why)
-    if "forbid_label" in task:
-        f_ok, why = check_forbid_label(answer, task["forbid_label"])
-        if not f_ok:
-            ok = False
-            reasons.append(why)
-    if "format" in task:
-        fm_ok, why = check_format(answer, task["format"])
-        if not fm_ok:
-            ok = False
-            reasons.append(f"format: {why}")
-    if "exec_tests" in task:
-        e_ok, why = check_exec(answer, task["exec_tests"])
-        if not e_ok:
-            ok = False
-            reasons.append(f"exec: {why}")
-    return ok, reasons
+
+    for key in ("require_all",):
+        for s in spec.get(key, []):
+            if s.lower() not in low:
+                reasons.append(f"missing required '{s}'")
+    for key in ("require_any", "require_any_2", "require_any_3"):
+        opts = spec.get(key)
+        if opts and not any(o.lower() in low for o in opts):
+            reasons.append(f"none of {opts} present")
+
+    if "label_any" in spec:
+        head = low[:80]
+        if not any(l in head for l in spec["label_any"]):
+            reasons.append(f"no acceptable label in {spec['label_any']} near start")
+    if "label_forbid_leading" in spec:
+        head = low[:40]
+        bad = spec["label_forbid_leading"]
+        # a leading bare Negative fails; "negative aspects" later is fine
+        if re.match(rf"\W*{bad}\b", head):
+            reasons.append(f"leading forbidden label '{bad}'")
+
+    if "sentences" in spec:
+        n = len(agent.split_sentences(answer))
+        if n != spec["sentences"]:
+            reasons.append(f"{n} sentences, expected {spec['sentences']}")
+    if "bullets" in spec:
+        bullets = agent.split_bullets(answer)
+        if len(bullets) != spec["bullets"]:
+            reasons.append(f"{len(bullets)} bullets, expected {spec['bullets']}")
+        mw = spec.get("bullet_max_words")
+        if mw and any(len(b.split()) > mw for b in bullets):
+            reasons.append(f"a bullet exceeds {mw} words")
+    if "max_words" in spec:
+        n = len((answer or "").split())
+        if n > spec["max_words"]:
+            reasons.append(f"{n} words, max {spec['max_words']}")
+
+    if "numeric" in spec:
+        v = agent.extract_number(answer)
+        want = spec["numeric"]
+        if v is None or not (abs(v - want) < 1e-6 or abs(round(v, 2) - round(want, 2)) < 1e-9):
+            reasons.append(f"numeric {v} != {want}")
+
+    if "answer_line_contains" in spec:
+        if spec["answer_line_contains"].lower() not in _answer_line(answer).lower():
+            reasons.append(f"answer line lacks '{spec['answer_line_contains']}'")
+    if "answer_line_regex" in spec:
+        if not re.search(spec["answer_line_regex"], _answer_line(answer), re.IGNORECASE):
+            reasons.append("answer line regex mismatch")
+
+    if "code_test" in spec:
+        ok, why = _run_code_test(answer, spec["code_test"], spec.get("code_func_hint", ""))
+        if not ok:
+            reasons.append(f"code test: {why}")
+    if "code_contains_any" in spec:
+        code = _extract_code(answer)
+        if not any(s in code for s in spec["code_contains_any"]):
+            reasons.append(f"code lacks any of {spec['code_contains_any']}")
+
+    return (len(reasons) == 0), reasons
 
 
 def main():
-    with open(os.path.join(HERE, "tasks.json")) as f:
-        tasks = json.load(f)
+    with open(os.path.join(HERE, "tasks.json"), encoding="utf-8") as f:
+        specs = json.load(f)
 
-    tmp = tempfile.mkdtemp(prefix="tokencascade-devset-")
-    in_path = os.path.join(tmp, "tasks.json")
-    out_path = os.path.join(tmp, "results.json")
-    log_path = os.path.join(tmp, "inference_log.json")
-    with open(in_path, "w") as f:
-        json.dump([{"task_id": t["task_id"], "prompt": t["prompt"]}
-                   for t in tasks], f)
+    gate_min = int(os.environ.get("GATE_MIN_CORRECT", "20"))
+    gate_max_s = float(os.environ.get("GATE_MAX_SECONDS", "420"))
 
-    env = dict(os.environ)
-    env.update({"INPUT_PATH": in_path, "OUTPUT_PATH": out_path,
-                "LOG_PATH": log_path})
-    env.setdefault("LOCAL_MODEL_PATH", os.path.join(ROOT, "model.gguf"))
-
-    print(f"[check] running main.py on {len(tasks)} tasks "
-          f"(threads={env.get('THREADS', 'auto')}, "
-          f"model={env['LOCAL_MODEL_PATH']})")
     t0 = time.time()
-    proc = subprocess.run([sys.executable, os.path.join(ROOT, "main.py")],
-                          env=env)
-    elapsed = time.time() - t0
-    if proc.returncode != 0:
-        print(f"[check] FATAL: main.py exited {proc.returncode}")
-        sys.exit(1)
+    local = agent.Local()
 
-    with open(out_path) as f:
-        results = {r["task_id"]: r.get("answer", "") for r in json.load(f)}
-    task_seconds = {}
-    try:
-        with open(log_path) as f:
-            task_seconds = json.load(f).get("task_seconds", {})
-    except Exception:
-        pass
-
-    missing_ids = [t["task_id"] for t in tasks if t["task_id"] not in results]
-    if missing_ids:
-        print(f"[check] FATAL: output missing task ids: {missing_ids}")
-        sys.exit(1)
-
-    correct = 0
-    per_cat = {}
-    report = {"tasks": [], "elapsed_s": round(elapsed, 1)}
-    print(f"\n{'task':<18}{'cat':<15}{'sec':>6}  verdict")
-    print("-" * 72)
-    for t in tasks:
-        tid, cat = t["task_id"], t.get("category", "?")
-        ans = results.get(tid, "")
-        ok, reasons = grade(t, ans)
+    report, correct = [], 0
+    for spec in specs:
+        tid, prompt = spec["task_id"], spec["prompt"]
+        cat = agent.classify(prompt)
+        ts = time.time()
+        try:
+            answer, info = agent.DISPATCH[cat](prompt, local, False)
+        except Exception as exc:
+            answer, info = "", {"verified": f"error: {exc}"}
+        dt = time.time() - ts
+        ok, reasons = grade(answer, spec["grade"])
         correct += ok
-        c = per_cat.setdefault(cat, [0, 0])
-        c[0] += ok
-        c[1] += 1
-        sec = task_seconds.get(tid, "")
-        verdict = "PASS" if ok else "FAIL  " + "; ".join(reasons)[:90]
-        print(f"{tid:<18}{cat:<15}{str(sec):>6}  {verdict}")
-        report["tasks"].append({"task_id": tid, "category": cat, "pass": ok,
-                                "seconds": sec, "reasons": reasons,
-                                "answer": ans})
+        report.append({"task_id": tid, "category": cat, "ok": ok,
+                       "seconds": round(dt, 1), "reasons": reasons,
+                       "verified": info.get("verified"), "answer": answer})
+        print(f"{'PASS' if ok else 'FAIL'} {tid:<14} {cat:<14} {dt:6.1f}s "
+              f"{'; '.join(reasons)[:100]}", flush=True)
 
-    print("-" * 72)
-    for cat in sorted(per_cat):
-        ok_n, tot = per_cat[cat]
-        print(f"  {cat:<18}{ok_n}/{tot}")
-    print(f"\n[check] TOTAL: {correct}/{len(tasks)} correct "
-          f"in {elapsed:.1f}s (gate: >={GATE_MIN} and <={GATE_SEC:.0f}s)")
+    total_s = time.time() - t0
+    summary = {"correct": correct, "total": len(specs),
+               "seconds": round(total_s, 1),
+               "gate_min_correct": gate_min, "gate_max_seconds": gate_max_s,
+               "pass": correct >= gate_min and total_s <= gate_max_s}
+    with open(os.path.join(ROOT, "devset_report.json"), "w", encoding="utf-8") as f:
+        json.dump({"summary": summary, "tasks": report}, f, indent=2, ensure_ascii=False)
 
-    report["correct"] = correct
-    report["total"] = len(tasks)
-    with open(os.path.join(os.getcwd(), "devset_report.json"), "w") as f:
-        json.dump(report, f, indent=2)
-
-    if correct < GATE_MIN or elapsed > GATE_SEC:
-        print("[check] GATE FAILED")
-        sys.exit(1)
-    print("[check] GATE PASSED")
+    print(f"\nGATE: {correct}/{len(specs)} correct in {total_s:.0f}s -> "
+          f"{'PASS' if summary['pass'] else 'FAIL'}", flush=True)
+    sys.exit(0 if summary["pass"] else 1)
 
 
 if __name__ == "__main__":

@@ -1,322 +1,46 @@
 [
-  {
-    "task_id": "pub-fact-1",
-    "category": "factual",
-    "source": "official_T01",
-    "prompt": "Name the three primary colors in the RGB color model and briefly explain why displays use RGB instead of RYB.",
-    "gold": [
-      "red",
-      "green",
-      "blue",
-      "additive"
-    ]
-  },
-  {
-    "task_id": "pub-fact-2",
-    "category": "factual",
-    "source": "official_T01b",
-    "prompt": "What is the difference between machine learning and deep learning? Briefly explain how each works.",
-    "gold": [
-      "subset",
-      "neural network",
-      "feature"
-    ]
-  },
-  {
-    "task_id": "pub-fact-3",
-    "category": "factual",
-    "source": "official_T01c",
-    "prompt": "Explain the difference between RAM and ROM in a computer. What is each type used for?",
-    "gold": [
-      "volatile",
-      "non-volatile",
-      "firmware"
-    ]
-  },
-  {
-    "task_id": "pub-math-1",
-    "category": "math",
-    "source": "official_T02",
-    "prompt": "A warehouse starts with 2,400 units. In Q1 it sells 37% of stock. In Q2 it restocks 800 units. In Q3 it sells 640 units. How many units remain at the end of Q3?",
-    "gold": [
-      "1672"
-    ]
-  },
-  {
-    "task_id": "pub-math-2",
-    "category": "math",
-    "source": "official_T02b",
-    "prompt": "A recipe requires 3/4 cup of sugar for 12 cookies. How much sugar is needed for 30 cookies? If sugar costs $2.40 per cup, what is the total cost of sugar for 30 cookies?",
-    "gold": [
-      "1.875",
-      "4.5"
-    ]
-  },
-  {
-    "task_id": "pub-sent-1",
-    "category": "sentiment",
-    "source": "official_T03",
-    "prompt": "Classify the sentiment of this customer review as Positive, Negative, or Neutral and give a one-sentence reason: 'The product arrived two days late and the packaging was damaged, but the item worked perfectly and customer support resolved my complaint within an hour.'",
-    "gold": [
-      "late",
-      "worked"
-    ],
-    "forbid_label": "negative"
-  },
-  {
-    "task_id": "pub-sent-2",
-    "category": "sentiment",
-    "source": "official_T03b",
-    "prompt": "Classify the sentiment of this tweet as Positive, Negative, or Neutral and give a one-sentence reason: 'Just got my order. Box was dented and the manual was missing, but honestly the device itself is flawless and set up in under 5 minutes.'",
-    "gold": [
-      "dented",
-      "flawless"
-    ],
-    "forbid_label": "negative"
-  },
-  {
-    "task_id": "pub-summ-1",
-    "category": "summarization",
-    "source": "official_T04",
-    "prompt": "Summarize the following passage in exactly two sentences:\n'Machine learning is increasingly deployed in healthcare for diagnosis, treatment planning, and patient monitoring. These systems analyse medical images, predict patient deterioration, and spot patterns in electronic health records that might be missed by human clinicians. However, concerns remain about model interpretability, data privacy, liability when errors occur, and the potential for algorithmic bias to worsen existing healthcare disparities. Regulatory frameworks are still catching up with the pace of deployment, creating uncertainty for healthcare providers and technology developers alike.'",
-    "gold": [
-      "healthcare"
-    ],
-    "format": {
-      "exact_sentences": 2
-    }
-  },
-  {
-    "task_id": "pub-summ-2",
-    "category": "summarization",
-    "source": "official_T04b",
-    "prompt": "Summarize the following passage in exactly three bullet points, each no longer than 15 words:\n'Remote work has transformed how companies operate globally. Employees gain flexibility and reduced commute times, leading to reported improvements in work-life balance. However, challenges persist around collaboration, company culture, and the blurring of personal and professional boundaries. Organisations are responding by investing in digital collaboration tools and rethinking office space as a hub for social and creative work rather than daily attendance.'",
-    "gold": [
-      "flexibility"
-    ],
-    "format": {
-      "exact_bullets": 3,
-      "max_words_per_bullet": 15
-    }
-  },
-  {
-    "task_id": "pub-ner-1",
-    "category": "ner",
-    "source": "official_T05",
-    "prompt": "Extract all named entities from the following text and label each as PERSON, ORGANIZATION, LOCATION, or DATE:\n'On March 15 2023, Sundar Pichai announced that Google would open a new AI research lab in Zurich, partnering with ETH Zurich to focus on large language model safety.'",
-    "gold": [
-      "sundar pichai",
-      "person",
-      "march 15 2023",
-      "date",
-      "google",
-      "organization",
-      "zurich",
-      "location",
-      "eth zurich"
-    ]
-  },
-  {
-    "task_id": "hard-logic-1",
-    "category": "logic",
-    "prompt": "Three friends - Ana, Ben, and Carla - each own exactly one pet: a cat, a dog, or a parrot. Ana does not own the dog. Ben is allergic to feathers, so he does not own the parrot. Carla's pet barks. Who owns which pet?",
-    "gold": [
-      "carla",
-      "dog",
-      "ben",
-      "cat",
-      "ana",
-      "parrot"
-    ],
-    "gold_near": [
-      [
-        "carla",
-        "dog",
-        50
-      ],
-      [
-        "ben",
-        "cat",
-        50
-      ],
-      [
-        "ana",
-        "parrot",
-        50
-      ]
-    ]
-  },
-  {
-    "task_id": "hard-logic-2",
-    "category": "logic",
-    "prompt": "Four runners finished a race. Dana finished before Erik but after Fay. Gio finished last. Who finished first, and in what order did all four finish?",
-    "gold": [
-      "fay",
-      "dana",
-      "erik",
-      "gio"
-    ],
-    "gold_order": [
-      "fay",
-      "dana",
-      "erik",
-      "gio"
-    ]
-  },
-  {
-    "task_id": "hard-logic-3",
-    "category": "logic",
-    "prompt": "In an office, Maya is taller than Noel. Noel is taller than Omar. Pia is shorter than Omar. Who is the tallest and who is the shortest? All conditions must be satisfied.",
-    "gold": [
-      "maya",
-      "pia"
-    ],
-    "gold_near": [
-      [
-        "maya",
-        "tallest",
-        60
-      ],
-      [
-        "pia",
-        "shortest",
-        60
-      ]
-    ]
-  },
-  {
-    "task_id": "hard-code-gen-1",
-    "category": "code_gen",
-    "prompt": "Write a Python function called is_palindrome(s) that returns True if the string s reads the same forwards and backwards, ignoring case and spaces.",
-    "gold": [
-      "def is_palindrome"
-    ],
-    "exec_tests": [
-      [
-        "is_palindrome('Race car')",
-        true
-      ],
-      [
-        "is_palindrome('hello')",
-        false
-      ],
-      [
-        "is_palindrome('A man a plan a canal Panama')",
-        true
-      ]
-    ]
-  },
-  {
-    "task_id": "hard-code-gen-2",
-    "category": "code_gen",
-    "prompt": "Write a Python function fizzbuzz(n) that returns a list of strings for the numbers 1 to n where multiples of 3 are 'Fizz', multiples of 5 are 'Buzz', multiples of both are 'FizzBuzz', and all other numbers are the number itself as a string.",
-    "gold": [
-      "def fizzbuzz"
-    ],
-    "exec_tests": [
-      [
-        "fizzbuzz(5)",
-        [
-          "1",
-          "2",
-          "Fizz",
-          "4",
-          "Buzz"
-        ]
-      ],
-      [
-        "fizzbuzz(15)[14]",
-        "FizzBuzz"
-      ]
-    ]
-  },
-  {
-    "task_id": "hard-code-debug-1",
-    "category": "code_debug",
-    "prompt": "This Python function is supposed to return the sum of the even numbers in a list, but it has a bug. Fix it:\n```python\ndef sum_evens(nums):\n    total = 0\n    for n in nums:\n        if n % 2 == 1:\n            total += n\n    return total\n```",
-    "gold": [
-      "def sum_evens"
-    ],
-    "exec_tests": [
-      [
-        "sum_evens([1,2,3,4,5,6])",
-        12
-      ],
-      [
-        "sum_evens([7,9])",
-        0
-      ]
-    ]
-  },
-  {
-    "task_id": "hard-code-debug-2",
-    "category": "code_debug",
-    "prompt": "This function should count how many times each word appears in a sentence, but it crashes. Fix the bug:\n```python\ndef word_counts(sentence):\n    counts = {}\n    for w in sentence.split():\n        counts[w] += 1\n    return counts\n```",
-    "gold": [
-      "def word_counts"
-    ],
-    "exec_tests": [
-      [
-        "word_counts('a b a')",
-        {
-          "a": 2,
-          "b": 1
-        }
-      ]
-    ]
-  },
-  {
-    "task_id": "hard-math-1",
-    "category": "math",
-    "prompt": "A tank holds 5,000 liters. It loses 12% of its water on Monday, gains 350 liters on Tuesday, and then loses 25% of the remaining water on Wednesday. How many liters are left after Wednesday?",
-    "gold": [
-      "3562.5"
-    ]
-  },
-  {
-    "task_id": "hard-summ-1",
-    "category": "summarization",
-    "prompt": "Summarize the following passage in exactly one sentence:\n'Electric vehicles have grown from a niche market into a mainstream option, driven by falling battery costs, expanding charging networks, and government incentives. Yet challenges remain, including raw material supply chains, grid capacity, and uneven adoption between urban and rural areas.'",
-    "gold": [
-      "electric"
-    ],
-    "format": {
-      "exact_sentences": 1
-    }
-  },
-  {
-    "task_id": "hard-ner-1",
-    "category": "ner",
-    "prompt": "Extract all named entities from the following text and label each as PERSON, ORGANIZATION, LOCATION, or DATE:\n'On June 3 2024, Satya Nadella visited Manila to announce that Microsoft would partner with De La Salle University on cloud research.'",
-    "gold": [
-      "satya nadella",
-      "person",
-      "june 3 2024",
-      "date",
-      "manila",
-      "location",
-      "microsoft",
-      "organization",
-      "de la salle university"
-    ]
-  },
-  {
-    "task_id": "hard-fact-1",
-    "category": "factual",
-    "prompt": "What is the difference between HTTP and HTTPS, and why do modern websites prefer HTTPS?",
-    "gold": [
-      "encrypt",
-      "secure"
-    ]
-  },
-  {
-    "task_id": "hard-sent-1",
-    "category": "sentiment",
-    "prompt": "Classify the sentiment of this review as Positive, Negative, or Neutral and give a one-sentence reason: 'The hotel room was spotless and the staff were wonderful, but the constant construction noise made it impossible to sleep.'",
-    "gold": [
-      "spotless",
-      "noise"
-    ],
-    "forbid_label": "negative"
-  }
+  {"task_id":"pub-fact-1","prompt":"Name the three primary colors in the RGB color model and briefly explain why displays use RGB instead of RYB.",
+   "grade":{"require_all":["red","green","blue"],"require_any":["additive","emit"]}},
+  {"task_id":"pub-fact-2","prompt":"What is the difference between machine learning and deep learning? Briefly explain how each works.",
+   "grade":{"require_all":["neural"],"require_any":["subset","type of machine learning","branch of machine learning"]}},
+  {"task_id":"pub-fact-3","prompt":"Explain the difference between RAM and ROM in a computer. What is each type used for?",
+   "grade":{"require_all":["volatile"],"require_any":["firmware","bios","permanent"]}},
+  {"task_id":"pub-math-1","prompt":"A warehouse starts with 2,400 units. In Q1 it sells 37% of stock. In Q2 it restocks 800 units. In Q3 it sells 640 units. How many units remain at the end of Q3?",
+   "grade":{"numeric":1672}},
+  {"task_id":"pub-math-2","prompt":"A recipe requires 3/4 cup of sugar for 12 cookies. How much sugar is needed for 30 cookies? If sugar costs $2.40 per cup, what is the total cost of sugar for 30 cookies?",
+   "grade":{"require_any":["4.50","4.5"],"require_any_2":["1.875","1.88","1.87"]}},
+  {"task_id":"pub-sent-1","prompt":"Classify the sentiment of this customer review as Positive, Negative, or Neutral and give a one-sentence reason: 'The product arrived two days late and the packaging was damaged, but the item worked perfectly and customer support resolved my complaint within an hour.'",
+   "grade":{"label_any":["mixed","neutral","positive"],"label_forbid_leading":"negative","require_any":["late","damaged","packaging"],"require_any_2":["worked","support","resolved","perfectly"]}},
+  {"task_id":"pub-sent-2","prompt":"Classify the sentiment of this tweet as Positive, Negative, or Neutral and give a one-sentence reason: 'Just got my order. Box was dented and the manual was missing, but honestly the device itself is flawless and set up in under 5 minutes.'",
+   "grade":{"label_any":["mixed","neutral","positive"],"label_forbid_leading":"negative","require_any":["dented","missing","manual","box"],"require_any_2":["flawless","setup","set up","5 minutes","fast"]}},
+  {"task_id":"pub-summ-1","prompt":"Summarize the following passage in exactly two sentences:\n'Machine learning is increasingly deployed in healthcare for diagnosis, treatment planning, and patient monitoring. These systems analyse medical images, predict patient deterioration, and spot patterns in electronic health records that might be missed by human clinicians. However, concerns remain about model interpretability, data privacy, liability when errors occur, and the potential for algorithmic bias to worsen existing healthcare disparities. Regulatory frameworks are still catching up with the pace of deployment, creating uncertainty for healthcare providers and technology developers alike.'",
+   "grade":{"sentences":2,"require_any":["diagnos","imag","monitor","predict","clinic","healthcare"],"require_any_2":["bias","privacy","interpret","liability","regulat","concern"]}},
+  {"task_id":"pub-summ-2","prompt":"Summarize the following passage in exactly three bullet points, each no longer than 15 words:\n'Remote work has transformed how companies operate globally. Employees gain flexibility and reduced commute times, leading to reported improvements in work-life balance. However, challenges persist around collaboration, company culture, and the blurring of personal and professional boundaries. Organisations are responding by investing in digital collaboration tools and rethinking office space as a hub for social and creative work rather than daily attendance.'",
+   "grade":{"bullets":3,"bullet_max_words":15,"require_any":["flexib","balance","commute"],"require_any_2":["collaborat","culture","boundar"],"require_any_3":["tool","office","invest","rethink"]}},
+  {"task_id":"pub-ner-1","prompt":"Extract all named entities from the following text and label each as PERSON, ORGANIZATION, LOCATION, or DATE:\n'On March 15 2023, Sundar Pichai announced that Google would open a new AI research lab in Zurich, partnering with ETH Zurich to focus on large language model safety.'",
+   "grade":{"require_all":["Sundar Pichai","Google","Zurich","ETH Zurich","March 15"],"require_any":["PERSON","person"]}},
+  {"task_id":"prac-fact","prompt":"What is the capital of Australia, and what body of water is it near?",
+   "grade":{"require_all":["Canberra"],"require_any":["Burley Griffin","Molonglo"]}},
+  {"task_id":"prac-math","prompt":"A store has 240 items. It sells 15% on Monday and 60 more on Tuesday. How many items remain?",
+   "grade":{"numeric":144}},
+  {"task_id":"prac-sent","prompt":"Classify the sentiment of this review: The battery life is great, but the screen scratches too easily.",
+   "grade":{"label_any":["mixed","neutral"],"require_any":["battery","great"],"require_any_2":["screen","scratch"]}},
+  {"task_id":"prac-summ","prompt":"Summarize the following in exactly one sentence: The regional office spent three months piloting a four-day work week, found that output stayed flat while sick days dropped by a third, and has now recommended adopting the schedule permanently across all branches starting next quarter.",
+   "grade":{"sentences":1,"require_any":["four-day","four day"],"require_any_2":["recommend","adopt","permanent"]}},
+  {"task_id":"prac-ner","prompt":"Extract all named entities and their types from: Maria Sanchez joined Fireworks AI in Berlin last March.",
+   "grade":{"require_all":["Maria Sanchez","Fireworks AI","Berlin","March"]}},
+  {"task_id":"prac-debug","prompt":"This function should return the max of a list but has a bug: def get_max(nums): return nums[0]. Find and fix it.",
+   "grade":{"code_contains_any":["max(","for "],"require_any":["bug","first element","nums[0]"]}},
+  {"task_id":"prac-logic","prompt":"Three friends, Sam, Jo, and Lee, each own a different pet: cat, dog, bird. Sam does not own the bird. Jo owns the dog. Who owns the cat?",
+   "grade":{"answer_line_contains":"Sam"}},
+  {"task_id":"prac-code","prompt":"Write a Python function that returns the second-largest number in a list, handling duplicates correctly.",
+   "grade":{"code_test":"assert f([1,2,3])==2 and f([5,5,4])==4 and f([2,1,2])==1","code_func_hint":"second"}},
+  {"task_id":"hard-math-1","prompt":"An investment of $3,000 grows by 12% in year one, loses 5% in year two, and grows by 8% in year three. What is its value at the end of year three, rounded to two decimal places?",
+   "grade":{"numeric":3447.36}},
+  {"task_id":"hard-logic-1","prompt":"Four employees—Jack, Kim, Leo, and Maya—sit in a row. Kim sits immediately to the left of Leo. Maya sits somewhere to the right of Leo. Jack is not at either end. Determine the seating order.",
+   "grade":{"answer_line_regex":"Kim.*(Leo|Jack).*(Jack|Leo).*Maya"}},
+  {"task_id":"hard-code-1","prompt":"Implement a Python function that merges two already sorted lists into one sorted list.",
+   "grade":{"code_test":"assert f([1,3,5],[2,4])==[1,2,3,4,5] and f([],[1])==[1] and f([2,2],[2])==[2,2,2]","code_func_hint":"merge"}},
+  {"task_id":"hard-summ-1","prompt":"Summarize in no more than 20 words:\nScientists created a low-power satellite communication device designed for remote disaster areas where traditional infrastructure has failed.",
+   "grade":{"max_words":20,"require_any":["satellite","communicat"],"require_any_2":["disaster","remote"]}}
 ]
