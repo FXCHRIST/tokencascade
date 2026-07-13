@@ -189,6 +189,19 @@ check("S9 model-load failure: exit 0 + complete all-fallback file",
       r.returncode == 0 and results is not None and len(results) == 8 and
       all(x["answer"] == agent.FALLBACK for x in results))
 
+# ---------------------------------------------------------------- S10
+r, results = run_agent({"SIM_LOGIC_TRUNCATED": "1"})
+logic_ans = by_id(results).get("practice-07", "")
+check("S10 truncated logic salvaged via conclude call",
+      "answer:" in logic_ans.lower() and "sam" in logic_ans.lower().split("answer:")[-1],
+      logic_ans[-50:])
+
+# ---------------------------------------------------------------- S11
+r, results = run_agent({"SIM_FACT_WRONG": "1"})
+fact_ans = by_id(results).get("practice-01", "")
+check("S11 factual self-check flags swap and ships correction",
+      "burley griffin" in fact_ans.lower(), fact_ans[:70])
+
 # ----------------------------------------------------------------
 print(f"\nOVERALL: {len(PASS)} pass, {len(FAIL)} fail "
       f"-> {'ALL SCENARIOS PASS' if not FAIL else 'FAILURES: ' + ', '.join(FAIL)}")
