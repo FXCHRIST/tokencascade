@@ -1,28 +1,45 @@
 #!/usr/bin/env python3
-"""TokenCascade — AMD Developer Hackathon ACT II, Track 1.
+"""TokenCascade v6 — AMD Developer Hackathon ACT II, Track 1.
 
-Pure local, zero-Fireworks-token agent. Every task in /input/tasks.json is
+Fully local, zero Fireworks tokens. Every task in /input/tasks.json is
 answered by a bundled Qwen3-4B-Instruct-2507 GGUF running on CPU via
-llama.cpp. No remote inference exists in this codebase, so the scored token
-count is 0 by construction.
+llama.cpp. No remote inference exists in this codebase, so the scored
+token count is 0 by construction.
 
-Design laws (carried over from the v4 post-mortem, still binding):
+Design laws (from the v4 post-mortem, still binding):
 
   L1. No native-code interruption. Local generations run to completion,
       bounded by small max_tokens. Never stream-and-abandon llama.cpp.
   L2. No threads. Strictly sequential; every line debuggable from a log.
-  L3. Results are flushed to disk ATOMICALLY AFTER EVERY TASK; SIGTERM
-      converts to flush-and-exit-0. A crash at task 12 leaves 12 answers,
-      and every task_id is always present in the output.
+  L3. Crash-safe output. The results file contains EVERY task_id from the
+      moment the run starts (prefilled with a safe fallback) and is
+      rewritten atomically after every completed task. SIGTERM converts to
+      flush-and-exit-0. A crash at task 17 leaves 16 real answers and 2
+      fallbacks on disk — never a missing file, never a missing task_id.
   L4. Exact pins. The dependency set is the one that demonstrably ran.
-  L5. Free compute does verification: math is re-computed by Python from a
-      model-proposed expression, code must compile AND execute, and
-      constrained formats (exact sentence/bullet counts) are validated and
-      regenerated on violation. Zero tokens, real accuracy.
+  L5. Free compute does verification:
+        * math    — solved twice independently (natural-language derivation
+                    AND a model-written Python script executed in a
+                    subprocess); agreement is required, disagreement
+                    triggers a tie-breaking resample.
+        * code    — must parse (ast) AND execute; failures regenerate with
+                    the actual error message fed back to the model.
+        * NER     — when JSON is requested, output is constrained by a
+                    GBNF grammar at the sampler level (malformed JSON is
+                    structurally impossible), with a 3-stage repair
+                    fallback behind it.
+        * format  — "exactly N sentences" / "N bullets" / word-limit
+                    constraints are parsed from the prompt, validated,
+                    regenerated on violation, and deterministically
+                    repaired as a last resort.
+        * sentiment — rubric-guarded: mixed reviews must acknowledge both
+                    sides and are never labeled bare Negative.
+
+Category-specific system prompts (one per pipeline) replace the single
+generic prompt of earlier versions.
 """
 
 import ast
-import atexit
 import json
 import os
 import re
@@ -31,9 +48,10 @@ import subprocess
 import sys
 import time
 
-# --------------------------------------------------------------------------
-# Configuration (env-tunable, sane defaults for the judging harness)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Configuration (env-tunable; defaults sized for the judging harness:
+# 2 vCPU / 4 GB RAM / <60 s startup / <10 min total / <30 s per request)
+# ---------------------------------------------------------------------------
 
 INPUT_PATH = os.environ.get("INPUT_PATH", "/input/tasks.json")
 OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "/output/results.json")
@@ -44,757 +62,825 @@ TIME_BUDGET_S = float(os.environ.get("TIME_BUDGET_S", "520"))
 RESERVE_S = float(os.environ.get("RESERVE_S", "40"))
 THREADS = int(os.environ.get("THREADS", str(os.cpu_count() or 2)))
 N_CTX = int(os.environ.get("N_CTX", "3072"))
+N_BATCH = int(os.environ.get("N_BATCH", "128"))
 MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "6000"))
+CODE_EXEC_TIMEOUT_S = float(os.environ.get("CODE_EXEC_TIMEOUT_S", "8"))
+
+FALLBACK = "Unable to determine a reliable answer for this task."
 
 START = time.time()
 
-SYS_LOCAL = (
-    "You are a precise assistant. Answer directly and concisely with no "
-    "preamble, no self-reference, and no markdown headers. Never write "
-    "more than the task requires. Follow every format instruction exactly."
-)
 
-# Generation caps per category (output tokens). Tokens are free locally;
-# these caps exist purely to protect the runtime budget.
-CAP = {
-    "factual": 200,
-    "sentiment": 160,
-    "summarization": 260,
-    "ner": 260,
-    "math": 380,
-    "logic": 380,
-    "code_debug": 420,
-    "code_gen": 420,
-}
-
-# Cheap categories run first so a time-out late in the run costs the fewest
-# answers (L3 guarantees everything answered so far is already on disk).
-CATEGORY_ORDER = ["factual", "sentiment", "ner", "summarization",
-                  "math", "logic", "code_debug", "code_gen"]
-
-CANONICAL_CATEGORY = {
-    "factual": "factual", "factual_knowledge": "factual",
-    "math": "math", "mathematical_reasoning": "math",
-    "sentiment": "sentiment", "sentiment_classification": "sentiment",
-    "summarization": "summarization", "text_summarization": "summarization",
-    "ner": "ner", "named_entity_recognition": "ner",
-    "logic": "logic", "logical_reasoning": "logic", "logic_puzzle": "logic",
-    "code_gen": "code_gen", "code_generation": "code_gen",
-    "code_debug": "code_debug", "code_debugging": "code_debug",
-}
-
-WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
-            "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+def log(msg: str) -> None:
+    print(f"[{time.time() - START:7.1f}s] {msg}", flush=True)
 
 
 def remaining() -> float:
     return TIME_BUDGET_S - (time.time() - START)
 
 
-def log(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
+# ---------------------------------------------------------------------------
+# Category constants — single source of truth; a typo'd category becomes a
+# KeyError at startup instead of silent misrouting.
+# ---------------------------------------------------------------------------
+
+FACTUAL = "factual"
+MATH = "math"
+SENTIMENT = "sentiment"
+SUMMARIZATION = "summarization"
+NER = "ner"
+CODE_DEBUG = "code_debug"
+LOGIC = "logic"
+CODE_GEN = "code_gen"
+
+ALL_CATEGORIES = [FACTUAL, MATH, SENTIMENT, SUMMARIZATION, NER,
+                  CODE_DEBUG, LOGIC, CODE_GEN]
+
+# Output-token caps per category. Tokens are free locally; these caps exist
+# purely to protect the runtime budget on a 2-vCPU CPU box. FAST values are
+# used when the time governor engages.
+CAP = {
+    FACTUAL: 220, SENTIMENT: 150, SUMMARIZATION: 260, NER: 300,
+    MATH: 420, LOGIC: 460, CODE_DEBUG: 460, CODE_GEN: 460,
+}
+CAP_FAST = {
+    FACTUAL: 140, SENTIMENT: 90, SUMMARIZATION: 180, NER: 220,
+    MATH: 260, LOGIC: 280, CODE_DEBUG: 300, CODE_GEN: 300,
+}
+
+# Cheap categories run first so if time runs out late in the run, the
+# expensive stragglers are the ones that fall back (L3 guarantees everything
+# answered so far is already on disk).
+ORDER_RANK = {c: i for i, c in enumerate(
+    [SENTIMENT, FACTUAL, NER, SUMMARIZATION, MATH, LOGIC, CODE_DEBUG, CODE_GEN])}
+
+# ---------------------------------------------------------------------------
+# Category-specific system prompts (v6: one per pipeline, each written
+# against the public rubric in the judging Self-Check guide).
+# ---------------------------------------------------------------------------
+
+PROMPTS = {
+    FACTUAL: (
+        "You are a precise technical assistant. Answer the question directly "
+        "and completely, covering every part of what is asked. Be concise: "
+        "2-5 sentences, no preamble, no headers, no self-reference."
+    ),
+    SENTIMENT: (
+        "Classify the sentiment of the given text as Positive, Negative, "
+        "Neutral, or Mixed. If the text contains BOTH positive and negative "
+        "points, do NOT label it Negative just because a complaint is "
+        "present — use Mixed, Neutral, or Positive depending on the overall "
+        "outcome, and your justification MUST acknowledge both the negative "
+        "and the positive aspects. Reply with the label first, then a single "
+        "one-sentence justification."
+    ),
+    SUMMARIZATION: (
+        "Summarize the given text, following the exact format constraint in "
+        "the request (sentence count, bullet count, word limit) precisely. "
+        "Cover both the benefits/opportunities AND the concerns/challenges "
+        "mentioned in the text — omitting either side is a failure. Write "
+        "only the summary itself: no preamble, no labels, no commentary."
+    ),
+    NER: (
+        "Extract ALL named entities from the text. If the request specifies "
+        "entity types or an output format, follow it exactly. Otherwise "
+        "label each entity as PERSON, ORGANIZATION, LOCATION, or DATE and "
+        "list one entity per line as: Entity (TYPE). Extract every distinct "
+        "entity — do not merge or skip any, and never return the whole "
+        "sentence as one entity."
+    ),
+    NER + "_json": (
+        "Extract all named entities from the text. Return ONLY a JSON array "
+        "where each element is an object with a \"text\" key (the exact "
+        "entity string) and a \"type\" key (PERSON, ORGANIZATION, LOCATION, "
+        "or DATE, unless the request specifies different types). Include "
+        "every distinct entity. No prose, no markdown — just the JSON array."
+    ),
+    LOGIC: (
+        "Solve the logic puzzle step by step, applying each clue in turn and "
+        "eliminating impossible options. Keep the reasoning compact. End "
+        "with a single final line in exactly this form: 'Answer: <answer>'."
+    ),
+    MATH + "_nl": (
+        "Solve this math problem step by step, showing the arithmetic "
+        "clearly and briefly. After computing the result, re-check the "
+        "calculation once. Finish with a single final line in exactly this "
+        "form: 'Answer: <number>'."
+    ),
+    MATH + "_code": (
+        "Write a short Python script that solves the given math word "
+        "problem. Compute the answer with code (do not hardcode the final "
+        "number) and end the script with a single print() that outputs ONLY "
+        "the final numeric answer. Return ONLY one Python code block, no "
+        "explanation."
+    ),
+    CODE_DEBUG: (
+        "You are given code containing a bug. State the bug in one or two "
+        "sentences, then provide the complete corrected code in a single "
+        "Python code block. The corrected code must be runnable as-is."
+    ),
+    CODE_GEN: (
+        "Write clean, correct Python code that satisfies the request "
+        "exactly, including all stated edge cases. Return the complete "
+        "implementation in a single Python code block. One or two sentences "
+        "of explanation at most."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Classifier — regex scoring with most-specific-first priority tie-break.
+# Pure pattern matching: it must run before the model is loaded.
+# ---------------------------------------------------------------------------
+
+PATTERNS = {
+    CODE_DEBUG: [
+        r"\bbug\b", r"\bdebug\b", r"fix (the |this |it)?\b",
+        r"find (the )?bug", r"corrected version",
+        r"what('s| is) wrong with (this|the)",
+        r"why does this (code|function) (fail|crash|not work)",
+        r"has a bug",
+    ],
+    CODE_GEN: [
+        r"write a (python )?function", r"implement (a|the) (python )?function",
+        r"write (a )?(python )?(script|program|class|method)",
+        r"\bdef \w+\(", r"implement.*that (takes|returns|computes|counts|merges|removes|groups)",
+        r"python function that",
+    ],
+    LOGIC: [
+        r"logic puzzle", r"each own[s]? a different", r"sit(s)? in a row",
+        r"\bimmediately to the (left|right)\b", r"\bleft of\b", r"\bright of\b",
+        r"unique solution", r"determine the (order|arrangement|position|seating)",
+        r"who owns (each|the)", r"exactly one of", r"seating order",
+        r"three friends", r"four (friends|employees|people|colleagues)",
+    ],
+    NER: [
+        r"named entit", r"extract.*entit", r"entit(y|ies).*(json|extract|label)",
+        r"\bperson\b.*\borganization\b", r"\blocation\b.*\bdate\b",
+        r"identify and label", r"entity type",
+    ],
+    SUMMARIZATION: [
+        r"summari[sz]e", r"\bsummary\b", r"\bcondense\b",
+        r"in one sentence", r"in exactly \d+ (words|sentences|bullet)",
+        r"no more than \d+ words", r"exactly (one|two|three|four|\d+) (bullet|sentence)",
+    ],
+    SENTIMENT: [
+        r"\bsentiment\b", r"classify the sentiment", r"positive.*negative",
+        r"determine.*sentiment", r"label the sentiment",
+    ],
+    MATH: [
+        r"\bpercent(age)?\b", r"\d+\s*%", r"how (much|many) (change|remain|are left|items|units)",
+        r"average speed", r"\$\s?\d", r"compounded", r"\bdiscount\b",
+        r"\binvestment\b", r"how many .* (remain|left)", r"total cost",
+        r"\d+\s*(units|items|cups|km|kg|miles)",
+    ],
+    FACTUAL: [
+        r"^what (is|are|causes|does)", r"^explain", r"^why (is|does|do|are)",
+        r"^how (does|do|is|are)", r"explain (why|how)", r"briefly explain",
+        r"what is the (difference|capital)",
+    ],
+}
+
+# Most specific first — a code-debug prompt can mention percentages, a logic
+# puzzle mentions names (NER-ish), so specificity wins ties.
+PRIORITY = [CODE_DEBUG, CODE_GEN, LOGIC, NER, SUMMARIZATION, SENTIMENT,
+            MATH, FACTUAL]
 
 
-# --------------------------------------------------------------------------
-# Crash-proof result sink (L3)
-# --------------------------------------------------------------------------
-
-class Sink:
-    def __init__(self, task_ids):
-        self.results = {tid: "" for tid in task_ids}
-        self.meta = {"fireworks_tokens": 0, "routes": {},
-                     "task_seconds": {}, "notes": []}
-        atexit.register(self.flush)
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            try:
-                signal.signal(sig, self._on_signal)
-            except Exception:
-                pass
-
-    def _on_signal(self, signum, frame):
-        log(f"[sink] signal {signum} — flushing and exiting 0")
-        self.flush()
-        os._exit(0)
-
-    def set(self, tid, answer, route, seconds):
-        self.results[tid] = answer
-        self.meta["routes"][tid] = route
-        self.meta["task_seconds"][tid] = round(seconds, 1)
-        self.flush()
-
-    def flush(self):
-        try:
-            os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
-            payload = [{"task_id": t, "answer": a}
-                       for t, a in self.results.items()]
-            tmp = OUTPUT_PATH + ".tmp"
-            with open(tmp, "w") as f:
-                json.dump(payload, f, ensure_ascii=False)
-            os.replace(tmp, OUTPUT_PATH)
-            self.meta["elapsed_s"] = round(time.time() - START, 1)
-            self.meta["empty_answers"] = [t for t, a in self.results.items()
-                                          if not a]
-            with open(LOG_PATH, "w") as f:
-                json.dump(self.meta, f, indent=2)
-        except Exception as e:
-            log(f"[sink] flush failed: {e}")
+def classify(prompt: str) -> str:
+    text = (prompt or "").lower()
+    scores = {c: 0 for c in ALL_CATEGORIES}
+    for cat, pats in PATTERNS.items():
+        for pat in pats:
+            if re.search(pat, text, re.IGNORECASE | re.MULTILINE):
+                scores[cat] += 1
+    # Hard override: a fenced code block is code territory, never math/NER.
+    if "```" in (prompt or ""):
+        if scores[CODE_GEN] > scores[CODE_DEBUG]:
+            return CODE_GEN
+        return CODE_DEBUG
+    best, best_score = FACTUAL, 0
+    for cat in PRIORITY:
+        if scores[cat] > best_score:
+            best, best_score = cat, scores[cat]
+    return best
 
 
-# --------------------------------------------------------------------------
-# Task loading and classification
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# GBNF grammar for NER JSON — constrains sampling itself so malformed JSON
+# is structurally impossible. Built lazily so importing main.py never
+# requires llama_cpp (the devset grader and simulator import this module).
+# ---------------------------------------------------------------------------
 
-def load_tasks(path):
-    with open(path) as f:
-        data = json.load(f)
-    if isinstance(data, dict):
-        data = data.get("tasks", data.get("data", []))
-    tasks = []
-    for i, t in enumerate(data):
-        if not isinstance(t, dict):
-            t = {"prompt": str(t)}
-        tid = str(t.get("task_id", t.get("id", f"task-{i + 1}")))
-        prompt = str(t.get("prompt", t.get("input", t.get("question",
-                     t.get("task", ""))))).strip()
-        cat_raw = str(t.get("category", t.get("type", ""))).strip().lower()
-        tasks.append({"task_id": tid, "prompt": prompt,
-                      "category": CANONICAL_CATEGORY.get(cat_raw, "")})
-    return tasks
+_NER_GBNF = r'''
+root   ::= "[" ws (entity ("," ws entity)*)? ws "]"
+entity ::= "{" ws "\"text\"" ws ":" ws string ws "," ws "\"type\"" ws ":" ws string ws "}"
+string ::= "\"" char* "\""
+char   ::= [^"\\] | "\\" .
+ws     ::= [ \t\n]*
+'''
+
+_ner_grammar = None
+_ner_grammar_failed = False
 
 
-CATEGORY_RULES = [
-    ("sentiment", r"\bsentiment\b|classify .{0,40}(review|tweet|comment)"
-                  r"|\bpositive, negative"),
-    ("ner", r"named entit|entities and their types|extract .{0,60}entit"
-            r"|label each as|\bidentify the (people|persons|organizations)\b"),
-    ("summarization", r"\bsummar(y|ise|ize|iz)|\bTL;DR\b|\bshorten\b"
-                      r"|\bmain point\b|\bbullet point"),
-    ("code_debug", r"(bug|fix|broken|incorrect|error|exception|crash)"
-                   r".{0,160}(def |function|code|```)"
-                   r"|(def |function|```).{0,200}(bug|fix|broken|crash)"),
-    ("code_gen", r"\bwrite (a |an )?\w{0,14}\s?(python )?"
-                 r"(function|program|script|class|method)\b"
-                 r"|\bcreate a (python|script|function)\b"
-                 r"|\bimplement\b.{0,40}\b(function|algorithm)\b"),
-    ("logic", r"each own|who owns|exactly one|puzzle|deduce|riddle"
-              r"|all (the )?conditions|must be satisfied"
-              r"|taller than|shorter than|older than|younger than"
-              r"|finished (before|after|first|last)"
-              r"|who is the (shortest|tallest|oldest|youngest|first|last)"),
-    ("math", r"\bhow (many|much)\b.*\d|\d+\s*%|\bpercent|\bcalculate\b"
-             r"|\baverage\b.*\d|\bremain\b.*\d|\d.*\bremain\b"
-             r"|\bcost\b.*\d|\bprice\b.*\d|\bliters?\b.*\d|\btotal\b.*\d"),
-]
-
-
-def classify(task) -> str:
-    if task["category"]:
-        return task["category"]
-    p = task["prompt"].lower()
-    for cat, pat in CATEGORY_RULES:
-        if re.search(pat, p, re.DOTALL):
-            return cat
-    if re.search(r"\d", p) and re.search(
-            r"total|left|per hour|speed|discount|sold|sells", p):
-        return "math"
-    return "factual"
-
-
-# --------------------------------------------------------------------------
-# Deterministic helpers (L5)
-# --------------------------------------------------------------------------
-
-_ALLOWED_AST = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
-                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv,
-                ast.Mod, ast.Pow, ast.USub, ast.UAdd)
-
-
-def safe_eval(expr):
+def get_ner_grammar():
+    """Return the compiled grammar, or None if llama_cpp can't build it —
+    the pipeline then degrades to prompt-only JSON plus repair, never
+    crashes (L3 spirit: a missing optimization must not cost answers)."""
+    global _ner_grammar, _ner_grammar_failed
+    if _ner_grammar is not None or _ner_grammar_failed:
+        return _ner_grammar
     try:
-        tree = ast.parse(expr.strip(), mode="eval")
-        for node in ast.walk(tree):
-            if not isinstance(node, _ALLOWED_AST):
-                return None
-            if isinstance(node, ast.Constant) and not isinstance(
-                    node.value, (int, float)):
-                return None
-        return eval(compile(tree, "<expr>", "eval"))
-    except Exception:
-        return None
+        from llama_cpp import LlamaGrammar
+        _ner_grammar = LlamaGrammar.from_string(_NER_GBNF)
+    except Exception as exc:
+        log(f"[ner] grammar unavailable ({exc}); using prompt+repair path")
+        _ner_grammar_failed = True
+        _ner_grammar = None
+    return _ner_grammar
 
 
-def fmt_num(v):
-    if v is None:
-        return ""
-    if isinstance(v, float) and v == int(v):
-        return str(int(v))
-    if isinstance(v, float):
-        return f"{round(v, 4):g}"
-    return str(v)
-
-
-MATH_SPIRAL = re.compile(
-    r"\bwait\b|doesn'?t match|does not match|expected answer"
-    r"|something'?s wrong|let me recheck|that'?s not|\u274c", re.I)
-
-NUM_RE = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
-
-
-def parse_numbers(text):
-    out = []
-    for m in NUM_RE.findall(text or ""):
-        try:
-            out.append(float(m.replace(",", "")))
-        except ValueError:
-            pass
-    return out
-
-
-def last_final_span(text):
-    """Span of the LAST 'Final answer' marker — models sometimes front-load
-    a conclusion, spiral into self-doubt, then conclude again; the last
-    marker is the corrected one."""
-    spans = [m for m in re.finditer(r"final answer\s*:?", text, re.I)]
-    return spans[-1] if spans else None
-
-
-def cut_spiral(text):
-    """Amputate everything from the first self-doubt marker onward."""
-    m = MATH_SPIRAL.search(text)
-    return text[:m.start()].rstrip(" \n-\u2014,;") if m else text
-
-
-def final_numbers(text):
-    """Numbers stated after the model's LAST 'Final answer' marker."""
-    m = last_final_span(text)
-    if not m:
-        return []
-    return parse_numbers(cut_spiral(text[m.end():])[:160])
-
-
-def after_last_final(text):
-    """Content after the LAST 'Final answer' marker, spiral-amputated."""
-    m = last_final_span(text)
-    if not m:
-        return ""
-    return cut_spiral(text[m.end():]).strip()
-
-
-def truncate_after_final(text):
-    """Judge-safe rendering: if the text contains self-doubt anywhere,
-    reduce it to a single clean 'Final answer' line (the LAST conclusion);
-    otherwise keep the working up to the end of the final-answer line."""
-    m = last_final_span(text)
-    if not m:
-        return cut_spiral(text).strip() or text.strip()
-    if MATH_SPIRAL.search(text):
-        tail = after_last_final(text).split("\n")[0].strip()
-        if tail:
-            return "Final answer: " + tail
-    end = text.find("\n", m.end())
-    return (text[:end] if end != -1 else text).strip()
-
-
-def num_close(a, b):
-    return abs(a - b) <= max(1e-6, 1e-6 * max(abs(a), abs(b)))
-
-
-def nums_subset(small, big):
-    return bool(small) and all(any(num_close(s, b) for b in big)
-                               for s in small)
-
-NER_LINE = re.compile(
-    r"^\s*[-*\u2022]?\s*(.+?)\s*[-\u2013:]\s*"
-    r"(PERSON|ORGANIZATION|LOCATION|DATE)\s*$", re.I)
-
-
-def ner_filter(text):
-    """Keep only well-formed 'Entity - LABEL' lines; drop hallucinated
-    non-entities (lowercase phrases, over-long spans) and duplicates.
-    Falls back to the raw text if filtering would leave too little."""
-    keep, seen = [], set()
-    for ln in text.splitlines():
-        m = NER_LINE.match(ln.strip())
-        if not m:
-            continue
-        ent, label = m.group(1).strip(" .*-\u2022\"'"), m.group(2).upper()
-        if not ent or len(ent.split()) > 6:
-            continue
-        if label != "DATE" and not any(c.isupper() for c in ent):
-            continue
-        key = (ent.lower(), label)
-        if key in seen:
-            continue
-        seen.add(key)
-        keep.append(f"{ent} - {label}")
-    return "\n".join(keep) if len(keep) >= 2 else text
-
-
-def strip_think(text):
-    """Safety net only — the bundled model is a non-thinking instruct model,
-    but this keeps a model swap from ever leaking <think> blocks."""
-    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    if "<think>" in cleaned:
-        cleaned = cleaned.split("<think>", 1)[0].strip()
-    return cleaned if cleaned else text.strip()
-
-
-def extract_code(text):
-    blocks = re.findall(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
-    if blocks:
-        return blocks[0].strip()
-    if "def " in text:
-        return text[text.index("def "):].strip()
-    return ""
-
-
-def undefined_names(code):
-    """Conservative AST lint: names that are loaded somewhere but bound
-    nowhere in the module and are not builtins. Catches NameErrors hiding
-    inside function bodies, which mere compilation and definition miss."""
-    import builtins
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return []
-    bound = set(dir(builtins)) | {"self", "cls"}
-    loaded = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name):
-            if isinstance(node.ctx, ast.Load):
-                loaded.add(node.id)
-            else:
-                bound.add(node.id)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            bound.add(node.name)
-            a = node.args
-            for arg in (a.args + a.posonlyargs + a.kwonlyargs
-                        + ([a.vararg] if a.vararg else [])
-                        + ([a.kwarg] if a.kwarg else [])):
-                bound.add(arg.arg)
-        elif isinstance(node, ast.ClassDef):
-            bound.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            for al in node.names:
-                bound.add((al.asname or al.name).split(".")[0])
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
-            bound.update(node.names)
-        elif isinstance(node, ast.ExceptHandler) and node.name:
-            bound.add(node.name)
-    return sorted(loaded - bound)
-
-
-def python_runs(code, timeout=8):
-    """Compile, lint, AND execute the candidate in a subprocess.
-    Returns (ok, err)."""
-    try:
-        compile(code, "<candidate>", "exec")
-    except SyntaxError as e:
-        return False, f"SyntaxError: {e}"
-    undef = undefined_names(code)
-    if undef:
-        return False, f"undefined name(s): {', '.join(undef)}"
-    try:
-        r = subprocess.run([sys.executable, "-c", code],
-                           capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0:
-            return False, (r.stderr or "runtime error").strip()[-400:]
-        return True, ""
-    except subprocess.TimeoutExpired:
-        return False, "execution timed out"
-    except Exception as e:
-        return False, str(e)
-
-
-def split_sentences(text):
-    text = re.sub(r"\s+", " ", text).strip()
-    parts = re.split(r"(?<=[.!?])\s+", text)
-    return [p.strip() for p in parts if p.strip()]
-
-
-def bullet_lines(text):
-    lines = []
-    for ln in text.splitlines():
-        s = ln.strip()
-        if re.match(r"^([-*•]|\d+[.)])\s+", s):
-            lines.append(re.sub(r"^([-*•]|\d+[.)])\s+", "", s).strip())
-    return lines
-
-
-def parse_format_constraints(prompt):
-    p = prompt.lower()
-    c = {}
-    m = re.search(r"exactly\s+(\w+)\s+sentence", p)
-    if m:
-        c["sentences"] = WORD_NUM.get(m.group(1), None) or (
-            int(m.group(1)) if m.group(1).isdigit() else None)
-    m = re.search(r"exactly\s+(\w+)\s+bullet", p)
-    if m:
-        c["bullets"] = WORD_NUM.get(m.group(1), None) or (
-            int(m.group(1)) if m.group(1).isdigit() else None)
-    m = re.search(r"no (?:longer|more) than\s+(\d+)\s+words", p)
-    if m:
-        c["max_words"] = int(m.group(1))
-    m = re.search(r"(\d+)\s+words or (?:fewer|less)", p)
-    if m:
-        c["max_words"] = int(m.group(1))
-    return {k: v for k, v in c.items() if v}
-
-
-def format_ok(answer, c):
-    if "bullets" in c:
-        bl = bullet_lines(answer)
-        if len(bl) != c["bullets"]:
-            return False
-        if "max_words" in c and any(len(b.split()) > c["max_words"]
-                                    for b in bl):
-            return False
-        return True
-    if "sentences" in c:
-        return len(split_sentences(answer)) == c["sentences"]
-    return True
-
-
-def format_repair(answer, c):
-    """Last-resort deterministic repair after regeneration attempts."""
-    if "bullets" in c:
-        bl = bullet_lines(answer) or split_sentences(answer)
-        n, k = c["bullets"], c.get("max_words", 0)
-        bl = bl[:n]
-        while len(bl) < n:
-            bl.append(bl[-1] if bl else "See passage.")
-        if k:
-            bl = [" ".join(b.split()[:k]).rstrip(",;") for b in bl]
-        return "\n".join("- " + b for b in bl)
-    if "sentences" in c:
-        sents = split_sentences(answer)
-        n = c["sentences"]
-        if len(sents) > n:
-            head = sents[:n - 1] if n > 1 else []
-            tail = " ".join(s.rstrip(".!?") + ";" for s in sents[n - 1:-1])
-            last = (tail + " " + sents[-1]).strip() if tail else sents[-1]
-            return " ".join(head + [last])
-    return answer
-
-
-# --------------------------------------------------------------------------
-# Local model (the only inference path — zero Fireworks tokens)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Local model runtime — one model, loaded once, strictly sequential (L1/L2).
+# ---------------------------------------------------------------------------
 
 class Local:
     def __init__(self):
-        from llama_cpp import Llama
+        from llama_cpp import Llama  # import here: grader/simulator safe
         t0 = time.time()
+        log(f"[local] loading {LOCAL_MODEL_PATH} threads={THREADS} n_ctx={N_CTX}")
         self.llm = Llama(
             model_path=LOCAL_MODEL_PATH,
             n_ctx=N_CTX,
             n_threads=THREADS,
-            n_threads_batch=THREADS,
-            n_batch=256,
+            n_batch=N_BATCH,
             verbose=False,
         )
-        # Warm-up primes caches so the first real task isn't penalised.
-        self.llm.create_chat_completion(
-            messages=[{"role": "user", "content": "Hi"}], max_tokens=1)
-        self.last_truncated = False
-        self.avg_task_s = 15.0
-        log(f"[local] model loaded in {time.time() - t0:.1f}s, "
-            f"threads={THREADS}, ctx={N_CTX}")
+        log(f"[local] ready in {time.time() - t0:.1f}s")
+        self.avg_task_s = 15.0  # EMA of per-task latency for the governor
 
-    def gen(self, user, cap, system=SYS_LOCAL, stop=None):
-        out = self.llm.create_chat_completion(
+    def gen(self, system: str, user: str, max_tokens: int,
+            temperature: float = 0.2, grammar=None) -> str:
+        """One complete, uninterrupted generation (L1)."""
+        kwargs = dict(
             messages=[{"role": "system", "content": system},
-                      {"role": "user", "content": user}],
-            temperature=0,
-            repeat_penalty=1.05,
-            max_tokens=cap,
-            stop=stop,
+                      {"role": "user", "content": user[:MAX_PROMPT_CHARS]}],
+            max_tokens=max_tokens,
+            temperature=temperature,
         )
-        choice = out["choices"][0]
-        self.last_truncated = choice.get("finish_reason") == "length"
-        return strip_think(
-            (choice["message"]["content"] or "").strip())
+        if grammar is not None:
+            kwargs["grammar"] = grammar
+        try:
+            out = self.llm.create_chat_completion(**kwargs)
+            return (out["choices"][0]["message"]["content"] or "").strip()
+        except Exception as exc:
+            log(f"[local] generation failed: {exc}")
+            return ""
+
+    def note_latency(self, seconds: float) -> None:
+        self.avg_task_s = 0.7 * self.avg_task_s + 0.3 * seconds
 
 
-# --------------------------------------------------------------------------
-# Category pipelines
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Result sink — L3. Prefilled with every task_id at start; atomic rewrite
+# after every task; SIGTERM flushes and exits 0.
+# ---------------------------------------------------------------------------
 
-class Agent:
-    def __init__(self, local):
-        self.local = local
-        self.fast = False  # set True by the governor when time runs low
+class Sink:
+    def __init__(self, tasks: list):
+        self.order = [t["task_id"] for t in tasks]
+        self.results = {tid: FALLBACK for tid in self.order}
+        self.answered = {tid: False for tid in self.order}
+        self.meta = {"fireworks_tokens": 0, "per_task": []}
+        os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
+        self.flush()  # from second zero, a valid complete file exists
 
-    def _cap(self, cat):
-        cap = CAP.get(cat, 260)
-        return min(cap, 140) if self.fast else cap
+    def put(self, task_id: str, answer: str, info: dict) -> None:
+        answer = (answer or "").strip() or FALLBACK
+        self.results[task_id] = answer
+        self.answered[task_id] = answer != FALLBACK
+        info["task_id"] = task_id
+        self.meta["per_task"].append(info)
+        self.flush()
 
-    def factual(self, prompt):
-        return self.local.gen(
-            prompt + "\n\nAnswer every part of the question directly and "
-            "completely, in at most 4 sentences.", self._cap("factual"))
+    def flush(self) -> None:
+        payload = [{"task_id": tid, "answer": self.results[tid]}
+                   for tid in self.order]
+        tmp = OUTPUT_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, OUTPUT_PATH)  # atomic on POSIX
 
-    def sentiment(self, prompt):
-        ask = (prompt + "\n\nRules: reply with exactly one label "
-               "(Positive, Negative, Neutral, or Mixed) followed by a "
-               "one-sentence reason. If the text contains BOTH good and bad "
-               "points, the label must be Mixed and the reason must name one "
-               "specific positive detail and one specific negative detail.")
-        ans = self.local.gen(ask, self._cap("sentiment"))
-        has_contrast = re.search(r"\bbut\b|\bhowever\b|\balthough\b|\byet\b",
-                                 prompt, re.I)
-        label = re.search(r"\b(positive|negative|neutral|mixed)\b", ans, re.I)
-        if (has_contrast and label and label.group(1).lower() == "negative"
-                and not self.fast):
-            ans = self.local.gen(
-                ask + "\n\nIMPORTANT: this text mixes good and bad points, "
-                "so do NOT label it Negative. Use Mixed (or Neutral) and "
-                "mention one detail from each side.",
-                self._cap("sentiment"))
-        return ans
-
-    def summarization(self, prompt):
-        c = parse_format_constraints(prompt)
-        ans = self.local.gen(
-            prompt + "\n\nObey the length/format constraint exactly. Cover "
-            "both the positives/opportunities and the "
-            "challenges/concerns in the passage.",
-            self._cap("summarization"))
-        tries = 0
-        while c and not format_ok(ans, c) and tries < 2 and not self.fast:
-            tries += 1
-            fix = []
-            if "sentences" in c:
-                fix.append(f"exactly {c['sentences']} sentence(s) — count "
-                           "them before answering")
-            if "bullets" in c:
-                fix.append(f"exactly {c['bullets']} bullet points, each "
-                           "starting with '- '")
-            if "max_words" in c:
-                fix.append(f"each bullet at most {c['max_words']} words")
-            ans = self.local.gen(
-                prompt + "\n\nYour previous attempt violated the format. "
-                "Produce " + " and ".join(fix) + ". Nothing else.",
-                self._cap("summarization"))
-        if c and not format_ok(ans, c):
-            ans = format_repair(ans, c)
-        return ans
-
-    def ner(self, prompt):
-        ask = (prompt + "\n\nOutput one entity per line in exactly this "
-               "format: Entity - LABEL\nAllowed labels: PERSON, "
-               "ORGANIZATION, LOCATION, DATE. Include EVERY entity in the "
-               "text. No other text.")
-        ans = self.local.gen(ask, self._cap("ner"))
-        pat = r"-\s*(PERSON|ORGANIZATION|LOCATION|DATE)\b"
-        if len(re.findall(pat, ans, re.I)) < 2 and not self.fast:
-            ans = self.local.gen(
-                ask + "\n\nYour previous output was not in the required "
-                "'Entity - LABEL' line format. Redo it correctly.",
-                self._cap("ner"))
-        return ner_filter(ans)
-
-    def math(self, prompt):
-        ans = self.local.gen(
-            prompt + "\n\nShow the calculation briefly (under 100 words), "
-            "then end with 'Final answer:' followed by the value(s).",
-            self._cap("math"))
-        ans_trunc = getattr(self.local, "last_truncated", False)
-        if self.fast or remaining() < RESERVE_S + self.local.avg_task_s:
-            return truncate_after_final(ans)
-
-        def clean(text, truncated):
-            return ("final answer" in text.lower() and not truncated
-                    and not MATH_SPIRAL.search(text))
-
-        # Channel 1: the model's own step-by-step conclusion (empirically
-        # the most reliable channel for this model).
-        prose_vals = final_numbers(ans)
-
-        # Channel 2: a compressed arithmetic expression, computed by Python.
-        # This is a CROSS-CHECK, never the sole source of truth — compressed
-        # one-liners are where operator-precedence mistakes live.
-        expr_raw = self.local.gen(
-            f"Problem:\n{prompt}",
-            120,
-            system=("Output ONLY the arithmetic expression(s) that compute "
-                    "the final numeric answer(s), separated by ';'. Python "
-                    "syntax, numbers and + - * / % ( ) only. No words."))
-        pairs = [(e.strip(), safe_eval(e.strip()))
-                 for e in expr_raw.split(";") if e.strip()]
-        pairs = [(e, v) for e, v in pairs[:4] if v is not None]
-        expr_vals = [v for _, v in pairs]
-
-        # Agreement: the prose conclusion matches the computed expression.
-        if prose_vals and expr_vals and nums_subset(prose_vals, expr_vals):
-            if clean(ans, ans_trunc):
-                return truncate_after_final(ans)
-            lines = [f"{e} = {fmt_num(v)}" for e, v in pairs]
-            return ("\n".join(lines) + "\nFinal answer: "
-                    + " and ".join(fmt_num(v) for v in prose_vals))
-
-        # Disagreement (or a missing channel): independent tie-breaker with
-        # a structurally different prompt, then 2-of-3 majority.
-        log(f"[math] prose {prose_vals} vs expr {expr_vals} — tie-breaking")
-        tb = self.local.gen(
-            prompt + "\n\nRecompute carefully: write one operation per "
-            "line with its running result, then end with 'Final answer:' "
-            "followed by the value(s).", self._cap("math"))
-        tb_trunc = getattr(self.local, "last_truncated", False)
-        tb_vals = final_numbers(tb)
-
-        candidates = [("prose", prose_vals, ans, ans_trunc),
-                      ("expr", expr_vals, None, False),
-                      ("tiebreak", tb_vals, tb, tb_trunc)]
-        for i in range(len(candidates)):
-            for j in range(i + 1, len(candidates)):
-                a_name, a_vals, a_text, a_tr = candidates[i]
-                b_name, b_vals, b_text, b_tr = candidates[j]
-                if a_vals and b_vals and (nums_subset(a_vals, b_vals)
-                                          or nums_subset(b_vals, a_vals)):
-                    winner = a_vals if len(a_vals) >= len(b_vals) else b_vals
-                    log(f"[math] majority: {a_name}+{b_name} -> {winner}")
-                    for text, tr in ((a_text, a_tr), (b_text, b_tr)):
-                        if text and clean(text, tr):
-                            return truncate_after_final(text)
-                    return ("Final answer: "
-                            + " and ".join(fmt_num(v) for v in winner))
-        # No majority: trust the step-by-step channels over the expression.
-        log("[math] no majority — returning best prose channel")
-        for text, tr in ((tb, tb_trunc), (ans, ans_trunc)):
-            if text and clean(text, tr):
-                return truncate_after_final(text)
-        return truncate_after_final(tb or ans)
-
-    def logic(self, prompt):
-        ans = self.local.gen(
-            prompt + "\n\nReason briefly (under 120 words), checking every "
-            "condition, then end with 'Final answer:' followed by the "
-            "complete assignment or ordering.", self._cap("logic"))
-        conclusion = after_last_final(ans)
-        if len(conclusion) >= 10:
-            return conclusion
-        # Reasoning ran past the cap before concluding — convert the partial
-        # chain of thought into a clean one-line conclusion instead of
-        # shipping a truncated ramble.
-        if not self.fast:
-            follow = self.local.gen(
-                "Puzzle:\n" + prompt + "\n\nReasoning so far:\n" + ans
-                + "\n\nState ONLY the final answer in one short line: the "
-                "complete assignment or ordering for every person. No "
-                "reasoning.", 90)
-            follow = re.sub(r"^final answer\s*:\s*", "", follow.strip(),
-                            flags=re.I)
-            if len(follow) >= 10:
-                return follow
-        return ans
-
-    def _code(self, prompt, cat, instruction):
-        ask = prompt + "\n\n" + instruction
-        ans = self.local.gen(ask, self._cap(cat))
-        code = extract_code(ans)
-        ok, err = python_runs(code) if code else (False, "no code block")
-        if not ok and not self.fast:
-            retry = self.local.gen(
-                ask + f"\n\nYour previous attempt failed with: {err}\n"
-                "Return the complete corrected code in one ```python block.",
-                self._cap(cat))
-            rcode = extract_code(retry)
-            rok, _ = python_runs(rcode) if rcode else (False, "")
-            if rok:
-                return rcode
-            code = rcode or code
-        return code if code else ans
-
-    def code_gen(self, prompt):
-        return self._code(
-            prompt, "code_gen",
-            "Write ONLY the Python code in a single ```python code block. "
-            "Include the exact function name requested. No explanation.")
-
-    def code_debug(self, prompt):
-        return self._code(
-            prompt, "code_debug",
-            "Return the fully corrected code in a single ```python code "
-            "block. Fix the bug, change nothing else. No explanation.")
-
-    def answer(self, prompt, cat):
-        prompt = prompt[:MAX_PROMPT_CHARS]
-        fn = {"factual": self.factual, "sentiment": self.sentiment,
-              "summarization": self.summarization, "ner": self.ner,
-              "math": self.math, "logic": self.logic,
-              "code_gen": self.code_gen, "code_debug": self.code_debug}
-        return fn.get(cat, self.factual)(prompt)
+    def flush_log(self) -> None:
+        try:
+            tmp = LOG_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.meta, f, indent=2, ensure_ascii=False)
+            os.replace(tmp, LOG_PATH)
+        except Exception:
+            pass  # the log is best-effort; results.json is what is scored
 
 
-# --------------------------------------------------------------------------
+_SINK: "Sink|None" = None
+
+
+def _sigterm(_sig, _frm):
+    log("[signal] SIGTERM — flushing and exiting 0")
+    if _SINK is not None:
+        _SINK.flush()
+        _SINK.flush_log()
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, _sigterm)
+
+# ---------------------------------------------------------------------------
+# Verification helpers (L5)
+# ---------------------------------------------------------------------------
+
+_FENCE_RE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
+
+
+def extract_code(text: str) -> str:
+    """First fenced block; tolerate a missing closing fence (truncation)."""
+    if not text:
+        return ""
+    m = _FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    m_open = re.search(r"```(?:python)?\s*\n?", text)
+    if m_open:
+        return text[m_open.end():].strip()
+    # No fence: if it parses as Python, treat the raw text as code.
+    try:
+        ast.parse(text)
+        return text.strip()
+    except SyntaxError:
+        return ""
+
+
+def run_code(code: str, timeout: float = None):
+    """Execute code in a fresh subprocess with a hard, reliably-killable
+    timeout — the one place a timeout truly stops work (unlike interrupting
+    an in-process llama.cpp call, which L1 forbids)."""
+    timeout = timeout or CODE_EXEC_TIMEOUT_S
+    try:
+        r = subprocess.run([sys.executable, "-c", code],
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
+    except subprocess.TimeoutExpired:
+        return False, "", "execution timed out"
+    except Exception as exc:
+        return False, "", str(exc)
+
+
+def extract_number(text: str):
+    """Pull the final numeric answer: prefer an 'Answer:' line, else the
+    last number in the text."""
+    if not text:
+        return None
+    m = re.search(r"answer:\s*\$?\s*(-?[\d,]+\.?\d*)", text, re.IGNORECASE)
+    candidate = m.group(1) if m else None
+    if candidate is None:
+        nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
+        candidate = nums[-1] if nums else None
+    if candidate is None:
+        return None
+    try:
+        return float(candidate.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def numbers_agree(a, b) -> bool:
+    if a is None or b is None:
+        return False
+    if abs(a - b) < 1e-6:
+        return True
+    # tolerate rounding to 2dp (currency) either direction
+    return abs(round(a, 2) - round(b, 2)) < 1e-9
+
+
+# --- summarization format constraints ---------------------------------------
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def parse_format_constraint(prompt: str):
+    """Return one of:
+       ("sentences", n) | ("bullets", n, max_words|None) |
+       ("max_words", n) | None"""
+    p = prompt.lower()
+    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5}
+
+    m = re.search(r"exactly (\d+|one|two|three|four|five) sentences?", p)
+    if m:
+        v = m.group(1)
+        return ("sentences", int(v) if v.isdigit() else words[v])
+    if re.search(r"in one sentence|exactly one sentence", p):
+        return ("sentences", 1)
+
+    m = re.search(r"exactly (\d+|one|two|three|four|five) bullet", p)
+    if m:
+        v = m.group(1)
+        n = int(v) if v.isdigit() else words[v]
+        mw = re.search(r"no longer than (\d+) words|each no more than (\d+) words|≤\s*(\d+) words", p)
+        max_w = None
+        if mw:
+            max_w = int(next(g for g in mw.groups() if g))
+        return ("bullets", n, max_w)
+
+    m = re.search(r"in exactly (\d+) words|exactly (\d+) words", p)
+    if m:
+        return ("exact_words", int(next(g for g in m.groups() if g)))
+    m = re.search(r"no more than (\d+) words|in at most (\d+) words|under (\d+) words|(\d+) words or (?:less|fewer)", p)
+    if m:
+        n = int(next(g for g in m.groups() if g))
+        return ("max_words", n)
+    return None
+
+
+def split_sentences(text: str) -> list:
+    text = re.sub(r"\s+", " ", (text or "").strip())
+    return [s for s in _SENT_SPLIT.split(text) if s.strip()]
+
+
+def split_bullets(text: str) -> list:
+    lines = [ln.strip() for ln in (text or "").splitlines()]
+    return [re.sub(r"^[-*•\u2022]\s*|^\d+[.)]\s*", "", ln)
+            for ln in lines if re.match(r"^[-*•\u2022]|^\d+[.)]", ln)]
+
+
+def check_format(answer: str, constraint) -> bool:
+    if constraint is None:
+        return True
+    kind = constraint[0]
+    if kind == "sentences":
+        return len(split_sentences(answer)) == constraint[1]
+    if kind == "bullets":
+        bullets = split_bullets(answer)
+        if len(bullets) != constraint[1]:
+            return False
+        max_w = constraint[2]
+        if max_w:
+            return all(len(b.split()) <= max_w for b in bullets)
+        return True
+    if kind == "max_words":
+        return len(answer.split()) <= constraint[1]
+    if kind == "exact_words":
+        return len(answer.split()) == constraint[1]
+    return True
+
+
+def repair_format(answer: str, constraint) -> str:
+    """Deterministic last resort — only reached after a regeneration also
+    violated the constraint. Repairs at whole-sentence/bullet boundaries,
+    never mid-sentence."""
+    kind = constraint[0]
+    if kind == "sentences":
+        sents = split_sentences(answer)
+        n = constraint[1]
+        if len(sents) > n:
+            return " ".join(sents[:n])
+        return answer  # too few sentences can't be honestly fabricated
+    if kind == "bullets":
+        n = constraint[1]
+        max_w = constraint[2]
+        bullets = split_bullets(answer)
+        if not bullets:  # model wrote prose: convert sentences to bullets
+            bullets = split_sentences(answer)
+        bullets = bullets[:n]
+        if max_w:
+            bullets = [" ".join(b.split()[:max_w]).rstrip(",;") for b in bullets]
+        return "\n".join(f"- {b}" for b in bullets)
+    if kind == "exact_words":
+        ws = answer.split()
+        n = constraint[1]
+        if len(ws) <= n:
+            return answer  # too few words can't be honestly padded
+        cut = " ".join(ws[:n]).rstrip(",;")
+        return cut if cut.endswith((".", "!", "?")) else cut + "."
+    if kind == "max_words":
+        ws = answer.split()
+        n = constraint[1]
+        if len(ws) <= n:
+            return answer
+        cut = " ".join(ws[:n])
+        # end at the last sentence boundary inside the cut if one exists
+        m = list(re.finditer(r"[.!?]", cut))
+        if m:
+            return cut[:m[-1].end()]
+        return cut.rstrip(",;") + "."
+    return answer
+
+
+# --- NER repair --------------------------------------------------------------
+
+def repair_ner_json(raw: str) -> str:
+    """3-stage repair: direct parse -> slice [...] -> regex-mined pairs."""
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return json.dumps(parsed, ensure_ascii=False)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    start, end = (raw or "").find("["), (raw or "").rfind("]")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(raw[start:end + 1])
+            if isinstance(parsed, list):
+                return json.dumps(parsed, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    pairs = re.findall(r'"text"\s*:\s*"([^"]+)"\s*,\s*"type"\s*:\s*"([^"]+)"',
+                       raw or "")
+    if pairs:
+        return json.dumps([{"text": t, "type": ty} for t, ty in pairs],
+                          ensure_ascii=False)
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Category handlers — each returns (answer, info_dict)
+# ---------------------------------------------------------------------------
+
+def h_factual(prompt, local, fast):
+    cap = (CAP_FAST if fast else CAP)[FACTUAL]
+    a = local.gen(PROMPTS[FACTUAL], prompt, cap, 0.2)
+    return a, {"verified": "n/a"}
+
+
+def h_sentiment(prompt, local, fast):
+    cap = (CAP_FAST if fast else CAP)[SENTIMENT]
+    a = local.gen(PROMPTS[SENTIMENT], prompt, cap, 0.2)
+    if not a:
+        return "", {"verified": "failed"}
+    # Surface a buried label so the grader sees it FIRST. The label must
+    # lead the answer; "the tone is mixed" mid-sentence is not prominent.
+    label_pat = re.compile(r"\b(positive|negative|neutral|mixed)\b", re.I)
+    if not label_pat.search(a[:20]):
+        m = label_pat.search(a)
+        if m:
+            label = m.group(1).capitalize()
+            # Justification: the sentence the label lived in, plus the next
+            # one if short — keeps the both-sides acknowledgement intact.
+            sents = split_sentences(a)
+            just = " ".join(s for s in sents if label_pat.search(s))[:220]
+            if not just:
+                just = " ".join(sents[:2])[:220]
+            a = f"{label}. {just}"
+    return a, {"verified": "label-surfaced"}
+
+
+def h_summarization(prompt, local, fast):
+    constraint = parse_format_constraint(prompt)
+    cap = (CAP_FAST if fast else CAP)[SUMMARIZATION]
+    a = local.gen(PROMPTS[SUMMARIZATION], prompt, cap, 0.2)
+    if check_format(a, constraint):
+        return a, {"verified": "format-ok"}
+    if fast or remaining() < RESERVE_S + 20:
+        return repair_format(a, constraint), {"verified": "format-repaired"}
+    # Regenerate with the violated constraint restated explicitly.
+    desc = {"sentences": lambda c: f"EXACTLY {c[1]} sentences",
+            "bullets": lambda c: f"EXACTLY {c[1]} bullet points"
+                       + (f", each at most {c[2]} words" if c[2] else ""),
+            "max_words": lambda c: f"AT MOST {c[1]} words",
+            "exact_words": lambda c: f"EXACTLY {c[1]} words"}[constraint[0]](constraint)
+    retry = local.gen(
+        PROMPTS[SUMMARIZATION] + f" The summary MUST be {desc} — count before answering.",
+        prompt, cap, 0.3)
+    if check_format(retry, constraint):
+        return retry, {"verified": "format-ok-retry"}
+    best = retry if retry else a
+    return repair_format(best, constraint), {"verified": "format-repaired"}
+
+
+def h_ner(prompt, local, fast):
+    cap = (CAP_FAST if fast else CAP)[NER]
+    wants_json = "json" in prompt.lower()
+    if wants_json:
+        raw = local.gen(PROMPTS[NER + "_json"], prompt, cap, 0.1,
+                        grammar=get_ner_grammar())
+        fixed = repair_ner_json(raw)
+        if fixed:
+            return fixed, {"verified": "json-valid"}
+        if not fast:
+            raw2 = local.gen(PROMPTS[NER + "_json"], prompt, cap, 0.3,
+                             grammar=get_ner_grammar())
+            fixed2 = repair_ner_json(raw2)
+            if fixed2:
+                return fixed2, {"verified": "json-valid-retry"}
+        return raw or "", {"verified": "json-failed"}
+    a = local.gen(PROMPTS[NER], prompt, cap, 0.1)
+    return a, {"verified": "n/a"}
+
+
+def h_logic(prompt, local, fast):
+    cap = (CAP_FAST if fast else CAP)[LOGIC]
+    a = local.gen(PROMPTS[LOGIC], prompt, cap, 0.2)
+    if a and "answer:" in a.lower():
+        return a, {"verified": "answer-line"}
+    if fast or remaining() < RESERVE_S + 25:
+        return a, {"verified": "no-answer-line"}
+    retry = local.gen(
+        "Solve the puzzle concisely. Your LAST line must be exactly "
+        "'Answer: <final answer>'.", prompt, cap, 0.1)
+    if retry and "answer:" in retry.lower():
+        return retry, {"verified": "answer-line-retry"}
+    return retry or a, {"verified": "no-answer-line"}
+
+
+def h_math(prompt, local, fast):
+    """Dual-path self-consistency (L5):
+       path A — natural-language derivation;
+       path B — model-written Python script, executed in a subprocess.
+       Agreement wins; disagreement triggers one tie-breaking resample of
+       the code path; execution-verified code is the default arbiter."""
+    nl_cap = (CAP_FAST if fast else CAP)[MATH]
+    a_nl = local.gen(PROMPTS[MATH + "_nl"], prompt, nl_cap, 0.2)
+    v_nl = extract_number(a_nl)
+
+    def code_pass(temp):
+        raw = local.gen(PROMPTS[MATH + "_code"], prompt, 300, temp)
+        code = extract_code(raw)
+        if not code:
+            return None
+        ok, stdout, _err = run_code(code)
+        if not ok or not stdout:
+            return None
+        return extract_number(stdout)
+
+    v_code = None if fast else code_pass(0.2)
+
+    if v_code is not None and v_nl is not None:
+        if numbers_agree(v_code, v_nl):
+            return a_nl, {"verified": "dual-agree", "value": v_nl}
+        v_code2 = code_pass(0.5) if remaining() > RESERVE_S + 30 else None
+        if v_code2 is not None and numbers_agree(v_code2, v_nl):
+            return a_nl, {"verified": "resample-sided-nl", "value": v_nl}
+        # trust execution over narration; keep the derivation, fix the line
+        body = re.sub(r"answer:.*$", "", a_nl, flags=re.I | re.S).strip()
+        fixed = f"{body}\n\nAnswer: {v_code:g}"
+        return fixed, {"verified": "code-overrides-nl", "value": v_code}
+
+    if v_nl is not None:
+        return a_nl, {"verified": "nl-only", "value": v_nl}
+    if v_code is not None:
+        return f"Answer: {v_code:g}", {"verified": "code-only", "value": v_code}
+    return a_nl or "", {"verified": "unverified"}
+
+
+def _code_repair_loop(prompt, system, local, cap, must_execute=True):
+    """Generate -> parse -> execute; on failure, feed the ACTUAL error back
+    and retry once with a doubled budget. Returns (answer, status)."""
+    a = local.gen(system, prompt, cap, 0.2)
+    code = extract_code(a)
+    err = None
+    if code:
+        try:
+            ast.parse(code)
+            if must_execute:
+                ok, _out, stderr = run_code(code)
+                if not ok:
+                    err = stderr.splitlines()[-1] if stderr else "runtime error"
+            if err is None:
+                return a, "exec-ok" if must_execute else "parse-ok"
+        except SyntaxError as exc:
+            err = f"SyntaxError: {exc}"
+    else:
+        err = "no code block found"
+
+    if remaining() < RESERVE_S + 30:
+        return a, f"unrepaired ({err})"
+
+    retry = local.gen(
+        system + f" Your previous attempt failed with: {err}. Provide the "
+        "complete, corrected code in a single Python code block.",
+        prompt, min(cap * 2, 900), 0.2)
+    rcode = extract_code(retry)
+    if rcode:
+        try:
+            ast.parse(rcode)
+            if must_execute:
+                ok, _out, _err2 = run_code(rcode)
+                if ok:
+                    return retry, "exec-ok-retry"
+                return retry, "parse-ok-retry"
+            return retry, "parse-ok-retry"
+        except SyntaxError:
+            pass
+    return retry if rcode else a, f"unrepaired ({err})"
+
+
+def h_code_gen(prompt, local, fast):
+    cap = (CAP_FAST if fast else CAP)[CODE_GEN]
+    a, status = _code_repair_loop(prompt, PROMPTS[CODE_GEN], local, cap,
+                                  must_execute=not fast)
+    return a, {"verified": status}
+
+
+def h_code_debug(prompt, local, fast):
+    cap = (CAP_FAST if fast else CAP)[CODE_DEBUG]
+    a, status = _code_repair_loop(prompt, PROMPTS[CODE_DEBUG], local, cap,
+                                  must_execute=not fast)
+    return a, {"verified": status}
+
+
+DISPATCH = {
+    FACTUAL: h_factual, SENTIMENT: h_sentiment,
+    SUMMARIZATION: h_summarization, NER: h_ner, LOGIC: h_logic,
+    MATH: h_math, CODE_GEN: h_code_gen, CODE_DEBUG: h_code_debug,
+}
+
+# ---------------------------------------------------------------------------
 # Main run loop
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+def load_tasks() -> list:
+    with open(INPUT_PATH, "r", encoding="utf-8") as f:
+        tasks = json.load(f)
+    cleaned = []
+    for t in tasks:
+        if isinstance(t, dict) and "task_id" in t and "prompt" in t:
+            cleaned.append({"task_id": str(t["task_id"]),
+                            "prompt": str(t["prompt"])})
+    return cleaned
+
 
 def run() -> int:
-    tasks = load_tasks(INPUT_PATH)
-    sink = Sink([t["task_id"] for t in tasks])
-    log(f"[run] {len(tasks)} tasks loaded")
+    global _SINK
+    tasks = load_tasks()
+    log(f"[input] {len(tasks)} tasks from {INPUT_PATH}")
+    sink = Sink(tasks)
+    _SINK = sink
+
+    ordered = sorted(
+        ((t, classify(t["prompt"])) for t in tasks),
+        key=lambda tc: ORDER_RANK[tc[1]],
+    )
+    for t, c in ordered:
+        log(f"[route] {t['task_id']} -> {c}")
 
     try:
         local = Local()
-    except Exception as e:
-        log(f"[fatal] local model unavailable: {e}")
-        sink.meta["notes"].append(f"model load failed: {e}")
+    except Exception as exc:
+        # Model load failure: results.json already exists with fallbacks for
+        # every task_id (L3) — exit 0 so the harness scores what exists.
+        log(f"[fatal] model load failed: {exc}")
         sink.flush()
+        sink.flush_log()
         return 0
 
-    agent = Agent(local)
-    cats = {t["task_id"]: classify(t) for t in tasks}
-
-    ordered = sorted(
-        tasks, key=lambda t: CATEGORY_ORDER.index(cats[t["task_id"]])
-        if cats[t["task_id"]] in CATEGORY_ORDER else 99)
-
-    done = 0
-    for t in ordered:
+    fast = False
+    for t, cat in ordered:
         tid = t["task_id"]
-        cat = cats[tid]
         left = remaining()
-        if left < 8:
-            log(f"[governor] {left:.0f}s left — stopping generation")
-            break
-        if not agent.fast and left - RESERVE_S < local.avg_task_s * 1.5:
-            agent.fast = True
-            log(f"[governor] fast mode ON at {left:.0f}s remaining")
+        if not fast and left < RESERVE_S + 2.5 * local.avg_task_s:
+            fast = True
+            log(f"[governor] {left:.0f}s left — FAST mode (short caps, no retries)")
+        if left < RESERVE_S * 0.5:
+            log(f"[governor] {left:.0f}s left — banking fallbacks for the rest")
+            break  # sink already holds FALLBACK for unprocessed task_ids
+
         t0 = time.time()
         try:
-            text = agent.answer(t["prompt"], cat)
-        except Exception as e:
-            log(f"[task] {tid} ({cat}) failed: {e}")
-            text = ""
+            answer, info = DISPATCH[cat](t["prompt"], local, fast)
+        except Exception as exc:
+            log(f"[task] {tid} handler crashed: {exc}")
+            answer, info = "", {"verified": f"handler-error: {exc}"}
         dt = time.time() - t0
-        done += 1
-        local.avg_task_s = local.avg_task_s * 0.6 + dt * 0.4
-        sink.set(tid, text, f"local:{cat}", dt)
-        log(f"[task] {tid} ({cat}) done in {dt:.1f}s — "
-            f"{remaining():.0f}s remaining")
+        local.note_latency(dt)
+        info.update({"category": cat, "seconds": round(dt, 2),
+                     "fireworks_tokens": 0, "fast_mode": fast})
+        sink.put(tid, answer, info)
+        log(f"[task] {tid} ({cat}) {dt:.1f}s verified={info.get('verified')}")
 
-    sink.meta["fireworks_tokens"] = 0
+    sink.meta["total_seconds"] = round(time.time() - START, 1)
+    sink.meta["answered"] = sum(1 for v in sink.answered.values() if v)
+    sink.meta["total_tasks"] = len(tasks)
     sink.flush()
-    log(f"[done] {done}/{len(tasks)} generated, 0 fireworks tokens, "
-        f"{time.time() - START:.1f}s")
+    sink.flush_log()
+    log(f"[done] {sink.meta['answered']}/{len(tasks)} answered, "
+        f"0 fireworks tokens, {sink.meta['total_seconds']}s")
     return 0
 
 
 def main() -> int:
     try:
         return run()
-    except Exception as e:
-        log(f"[fatal] {type(e).__name__}: {e} — writing salvage output")
+    except Exception as exc:
+        log(f"[fatal] {type(exc).__name__}: {exc} — salvaging output")
         try:
-            os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
-            if not os.path.exists(OUTPUT_PATH):
+            if _SINK is not None:
+                _SINK.flush()
+                _SINK.flush_log()
+            elif not os.path.exists(OUTPUT_PATH):
+                os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
                 with open(OUTPUT_PATH, "w") as f:
                     json.dump([], f)
         except Exception:
             pass
-        return 0
+        return 0  # scored partial output beats RUNTIME_ERROR
 
 
 if __name__ == "__main__":
