@@ -101,12 +101,15 @@ ALL_CATEGORIES = [FACTUAL, MATH, SENTIMENT, SUMMARIZATION, NER,
 # used when the time governor engages.
 CAP = {
     FACTUAL: 220, SENTIMENT: 150, SUMMARIZATION: 260, NER: 300,
-    MATH: 420, LOGIC: 460, CODE_DEBUG: 460, CODE_GEN: 460,
+    MATH: 300, LOGIC: 460, CODE_DEBUG: 460, CODE_GEN: 460,
 }
 CAP_FAST = {
     FACTUAL: 140, SENTIMENT: 90, SUMMARIZATION: 180, NER: 220,
-    MATH: 260, LOGIC: 280, CODE_DEBUG: 300, CODE_GEN: 300,
+    MATH: 200, LOGIC: 280, CODE_DEBUG: 300, CODE_GEN: 300,
 }
+MATH_CODE_CAP = 240        # the code path is terse by design
+LOGIC_CONCLUDE_CAP = 60    # salvage call: one Answer line only
+FACTUAL_CHECK_CAP = 90     # self-verification review pass
 
 # Cheap categories run first so if time runs out late in the run, the
 # expensive stragglers are the ones that fall back (L3 guarantees everything
@@ -122,8 +125,9 @@ ORDER_RANK = {c: i for i, c in enumerate(
 PROMPTS = {
     FACTUAL: (
         "You are a precise technical assistant. Answer the question directly "
-        "and completely, covering every part of what is asked. Be concise: "
-        "2-5 sentences, no preamble, no headers, no self-reference."
+        "and completely, covering every part of what is asked. State specific "
+        "facts confidently — never hedge between alternatives or speculate. "
+        "Be concise: 2-5 sentences, no preamble, no headers, no self-reference."
     ),
     SENTIMENT: (
         "Classify the sentiment of the given text as Positive, Negative, "
@@ -157,15 +161,23 @@ PROMPTS = {
         "every distinct entity. No prose, no markdown — just the JSON array."
     ),
     LOGIC: (
-        "Solve the logic puzzle step by step, applying each clue in turn and "
-        "eliminating impossible options. Keep the reasoning compact. End "
-        "with a single final line in exactly this form: 'Answer: <answer>'."
+        "Solve the logic puzzle by applying each clue in turn. Reason in "
+        "compact plain text: no markdown, no headers, do NOT restate the "
+        "clues or the setup. A few short lines of deduction, then end with "
+        "a single final line in exactly this form: 'Answer: <answer>'."
     ),
     MATH + "_nl": (
-        "Solve this math problem step by step, showing the arithmetic "
-        "clearly and briefly. After computing the result, re-check the "
-        "calculation once. Finish with a single final line in exactly this "
-        "form: 'Answer: <number>'."
+        "Solve this math problem step by step in brief plain text: no "
+        "markdown, no LaTeX, no restating the problem, no double-checking "
+        "section. Show each arithmetic step on one short line. If the "
+        "problem has multiple parts, answer every part. Finish with a "
+        "single final line in exactly this form: 'Answer: <number>'."
+    ),
+    MATH + "_expr": (
+        "Reply with ONLY a single Python arithmetic expression that "
+        "computes the final answer to this problem. Numbers and the "
+        "operators + - * / ** ( ) only. No variables, no words, no code "
+        "block, no explanation — just the expression on one line."
     ),
     MATH + "_code": (
         "Write a short Python script that solves the given math word "
@@ -434,13 +446,44 @@ def run_code(code: str, timeout: float = None):
         return False, "", str(exc)
 
 
+_ALLOWED_AST = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant,
+                ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow,
+                ast.FloorDiv, ast.Mod, ast.USub, ast.UAdd)
+
+
+def safe_eval(expr: str):
+    """Evaluate a pure-arithmetic expression. Anything beyond numbers and
+    + - * / ** // % (names, calls, subscripts, strings) is rejected."""
+    expr = (expr or "").strip().strip("`").strip()
+    if not expr or len(expr) > 300:
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, _ALLOWED_AST):
+            return None
+        if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+            return None
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Pow):
+            e = node.right
+            if not (isinstance(e, ast.Constant) and isinstance(e.value, (int, float))
+                    and abs(e.value) <= 64):
+                return None
+    try:
+        return float(eval(compile(tree, "<expr>", "eval"), {"__builtins__": {}}, {}))
+    except Exception:
+        return None
+
+
 def extract_number(text: str):
     """Pull the final numeric answer: prefer an 'Answer:' line, else the
     last number in the text."""
     if not text:
         return None
-    m = re.search(r"answer:\s*\$?\s*(-?[\d,]+\.?\d*)", text, re.IGNORECASE)
-    candidate = m.group(1) if m else None
+    ms = re.findall(r"answer:\s*\$?\s*(-?[\d,]+\.?\d*)", text, re.IGNORECASE)
+    candidate = ms[-1] if ms else None
     if candidate is None:
         nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
         candidate = nums[-1] if nums else None
@@ -604,10 +647,34 @@ def repair_ner_json(raw: str) -> str:
 # Category handlers — each returns (answer, info_dict)
 # ---------------------------------------------------------------------------
 
+FACTUAL_SELFCHECK = os.environ.get("FACTUAL_SELFCHECK", "1") == "1"
+
+
 def h_factual(prompt, local, fast):
     cap = (CAP_FAST if fast else CAP)[FACTUAL]
     a = local.gen(PROMPTS[FACTUAL], prompt, cap, 0.2)
-    return a, {"verified": "n/a"}
+    if not a or fast or not FACTUAL_SELFCHECK or remaining() < RESERVE_S + 120:
+        return a, {"verified": "n/a"}
+    # Concept-swap guard: generation drift can attach the right physics to
+    # the wrong term (observed: "RGB is subtractive"). The model knows the
+    # fact when asked to review, so one cheap check catches it.
+    review = local.gen(
+        "Review the answer for factual errors, especially swapped or "
+        "misattributed terms. If the answer is fully correct, reply with "
+        "exactly: OK. Otherwise state the single most important error in "
+        "one short sentence.",
+        f"Question: {prompt}\n\nAnswer: {a}",
+        FACTUAL_CHECK_CAP, 0.1)
+    rv = (review or "").strip()
+    if not rv or rv[:2].upper() == "OK":
+        return a, {"verified": "selfcheck-ok"}
+    fixed = local.gen(
+        PROMPTS[FACTUAL] + " A reviewer identified this error in a previous "
+        f"answer: {rv[:200]} Write the corrected answer.",
+        prompt, cap, 0.2)
+    if fixed:
+        return fixed, {"verified": "selfcheck-corrected"}
+    return a, {"verified": "selfcheck-flagged-unfixed"}
 
 
 def h_sentiment(prompt, local, fast):
@@ -680,11 +747,27 @@ def h_logic(prompt, local, fast):
     a = local.gen(PROMPTS[LOGIC], prompt, cap, 0.2)
     if a and "answer:" in a.lower():
         return a, {"verified": "answer-line"}
+
+    # Reasoning exists but no Answer line — almost always cap truncation
+    # (the hard-logic-1 failure mode). The deduction work is already done,
+    # so salvage it with a cheap conclude call instead of a full re-solve.
+    if a:
+        conclude = local.gen(
+            "You are given a logic puzzle and a partial line of reasoning "
+            "that was cut off. Based on that reasoning, reply with ONLY one "
+            "line in exactly this form: 'Answer: <final answer>'. No other "
+            "text.",
+            prompt + "\n\nReasoning so far:\n" + a[-1400:],
+            LOGIC_CONCLUDE_CAP, 0.1)
+        m = re.search(r"answer:.*", conclude or "", re.IGNORECASE)
+        if m:
+            return a + "\n\n" + m.group(0).strip(), {"verified": "concluded"}
+
     if fast or remaining() < RESERVE_S + 25:
         return a, {"verified": "no-answer-line"}
     retry = local.gen(
-        "Solve the puzzle concisely. Your LAST line must be exactly "
-        "'Answer: <final answer>'.", prompt, cap, 0.1)
+        "Solve the puzzle in a few short plain-text lines. Your LAST line "
+        "must be exactly 'Answer: <final answer>'.", prompt, 320, 0.1)
     if retry and "answer:" in retry.lower():
         return retry, {"verified": "answer-line-retry"}
     return retry or a, {"verified": "no-answer-line"}
@@ -700,8 +783,13 @@ def h_math(prompt, local, fast):
     a_nl = local.gen(PROMPTS[MATH + "_nl"], prompt, nl_cap, 0.2)
     v_nl = extract_number(a_nl)
 
+    def expr_pass(temp=0.1):
+        raw = local.gen(PROMPTS[MATH + "_expr"], prompt, 60, temp)
+        line = (raw or "").strip().splitlines()
+        return safe_eval(line[0]) if line else None
+
     def code_pass(temp):
-        raw = local.gen(PROMPTS[MATH + "_code"], prompt, 300, temp)
+        raw = local.gen(PROMPTS[MATH + "_code"], prompt, MATH_CODE_CAP, temp)
         code = extract_code(raw)
         if not code:
             return None
@@ -710,12 +798,18 @@ def h_math(prompt, local, fast):
             return None
         return extract_number(stdout)
 
-    v_code = None if fast else code_pass(0.2)
+    # Cheap deterministic check first (~30 output tokens); the full script
+    # path only runs when the expression fails to produce a value.
+    v_code = None
+    if not fast:
+        v_code = expr_pass()
+        if v_code is None:
+            v_code = code_pass(0.2)
 
     if v_code is not None and v_nl is not None:
         if numbers_agree(v_code, v_nl):
             return a_nl, {"verified": "dual-agree", "value": v_nl}
-        v_code2 = code_pass(0.5) if remaining() > RESERVE_S + 30 else None
+        v_code2 = code_pass(0.5) if remaining() > RESERVE_S + 60 else None
         if v_code2 is not None and numbers_agree(v_code2, v_nl):
             return a_nl, {"verified": "resample-sided-nl", "value": v_nl}
         # trust execution over narration; keep the derivation, fix the line

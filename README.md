@@ -20,9 +20,11 @@ correctness, format compliance, reliability, and runtime.
       ▼
  verification layer (free compute, zero tokens):
    • math      — solved TWICE independently: a natural-language derivation
-                 AND a model-written Python script executed in a subprocess.
-                 Agreement required; disagreement triggers a tie-breaking
-                 resample; execution-verified code arbitrates.
+                 AND a deterministic computation (a model-proposed pure
+                 arithmetic expression evaluated by an AST-sandboxed
+                 safe_eval, with a model-written script executed in a
+                 subprocess as fallback). Agreement required; disagreement
+                 triggers a tie-breaking resample; computation arbitrates.
    • code      — must parse (ast) AND execute; failures regenerate with the
                  ACTUAL error message fed back to the model.
    • ner       — when JSON is requested, sampling is constrained by a GBNF
@@ -34,6 +36,12 @@ correctness, format compliance, reliability, and runtime.
                  sentence/bullet boundaries as a last resort.
    • sentiment — rubric-guarded: mixed reviews must acknowledge both sides,
                  are never labeled bare Negative, and the label always leads.
+   • factual   — a self-verification review pass catches concept swaps
+                 (e.g. additive/subtractive attached to the wrong model)
+                 and triggers one corrective regeneration.
+   • logic     — truncated reasoning is salvaged by a cheap conclude call
+                 that extracts the final answer line from work already done,
+                 instead of an expensive full re-solve.
       │
       ▼
  crash-safe sink ──► /output/results.json  (+ /output/inference_log.json)
