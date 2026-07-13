@@ -202,6 +202,16 @@ fact_ans = by_id(results).get("practice-01", "")
 check("S11 factual self-check flags swap and ships correction",
       "burley griffin" in fact_ans.lower(), fact_ans[:70])
 
+# ---------------------------------------------------------------- S12
+# Starved budget: agent must degrade gracefully — complete file, exit 0,
+# no hang past the wall (the anti-TIMEOUT contract).
+t_start = time.time()
+r, results = run_agent({"TIME_BUDGET_S": "6", "SIM_SLOW_S": "0.7"}, timeout=60)
+wall = time.time() - t_start
+check("S12 starved budget: exit 0, complete file, stops near the wall",
+      r.returncode == 0 and results is not None and len(results) == 8 and wall < 25,
+      f"rc={r.returncode} ids={len(results or [])} wall={wall:.1f}s")
+
 # ----------------------------------------------------------------
 print(f"\nOVERALL: {len(PASS)} pass, {len(FAIL)} fail "
       f"-> {'ALL SCENARIOS PASS' if not FAIL else 'FAILURES: ' + ', '.join(FAIL)}")
