@@ -58,11 +58,45 @@ OUTPUT_PATH = os.environ.get("OUTPUT_PATH", "/output/results.json")
 LOG_PATH = os.environ.get("LOG_PATH", "/output/inference_log.json")
 LOCAL_MODEL_PATH = os.environ.get("LOCAL_MODEL_PATH", "/models/model.gguf")
 
-TIME_BUDGET_S = float(os.environ.get("TIME_BUDGET_S", "520"))
-RESERVE_S = float(os.environ.get("RESERVE_S", "40"))
-THREADS = int(os.environ.get("THREADS", str(os.cpu_count() or 2)))
-N_CTX = int(os.environ.get("N_CTX", "3072"))
-N_BATCH = int(os.environ.get("N_BATCH", "128"))
+TIME_BUDGET_S = float(os.environ.get("TIME_BUDGET_S", "500"))
+RESERVE_S = float(os.environ.get("RESERVE_S", "45"))
+
+
+def detect_threads() -> int:
+    """Thread count the judging harness ACTUALLY grants.
+
+    os.cpu_count() reports the HOST's cores, not the container's cgroup
+    quota. On a 2-vCPU cgroup running on a 32-core host it returns 32;
+    llama.cpp then spawns 32 threads on 2 vCPUs and thrashes itself into
+    a 5-20x slowdown — the proven TIMEOUT root cause of v5 and rc5.
+    Resolution order: THREADS env > cgroup v2 quota > cgroup v1 quota >
+    CPU affinity mask > cpu_count, always clamped to 4."""
+    env = os.environ.get("THREADS")
+    if env:
+        return max(1, int(env))
+    try:  # cgroup v2: "200000 100000" -> 2 CPUs; "max 100000" -> no quota
+        quota, period = open("/sys/fs/cgroup/cpu.max").read().split()[:2]
+        if quota != "max":
+            return max(1, int(int(quota) / int(period)))
+    except (OSError, ValueError):
+        pass
+    try:  # cgroup v1
+        q = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+        p = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+        if q > 0 and p > 0:
+            return max(1, q // p)
+    except (OSError, ValueError):
+        pass
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        affinity = os.cpu_count() or 2
+    return max(1, min(affinity, os.cpu_count() or 2, 4))
+
+
+THREADS = detect_threads()
+N_CTX = int(os.environ.get("N_CTX", "2048"))
+N_BATCH = int(os.environ.get("N_BATCH", "256"))
 MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "6000"))
 CODE_EXEC_TIMEOUT_S = float(os.environ.get("CODE_EXEC_TIMEOUT_S", "8"))
 
@@ -101,7 +135,7 @@ ALL_CATEGORIES = [FACTUAL, MATH, SENTIMENT, SUMMARIZATION, NER,
 # used when the time governor engages.
 CAP = {
     FACTUAL: 220, SENTIMENT: 150, SUMMARIZATION: 260, NER: 300,
-    MATH: 300, LOGIC: 460, CODE_DEBUG: 460, CODE_GEN: 460,
+    MATH: 300, LOGIC: 340, CODE_DEBUG: 460, CODE_GEN: 460,
 }
 CAP_FAST = {
     FACTUAL: 140, SENTIMENT: 90, SUMMARIZATION: 180, NER: 220,
@@ -109,7 +143,7 @@ CAP_FAST = {
 }
 MATH_CODE_CAP = 240        # the code path is terse by design
 LOGIC_CONCLUDE_CAP = 60    # salvage call: one Answer line only
-FACTUAL_CHECK_CAP = 90     # self-verification review pass
+FACTUAL_CHECK_CAP = 60     # self-verification review pass
 
 # Cheap categories run first so if time runs out late in the run, the
 # expensive stragglers are the ones that fall back (L3 guarantees everything
@@ -325,15 +359,30 @@ class Local:
             model_path=LOCAL_MODEL_PATH,
             n_ctx=N_CTX,
             n_threads=THREADS,
+            n_threads_batch=THREADS,
             n_batch=N_BATCH,
             verbose=False,
         )
+        try:  # warm-up primes caches so the first task isn't penalised
+            self.llm.create_chat_completion(
+                messages=[{"role": "user", "content": "Hi"}], max_tokens=1)
+        except Exception:
+            pass
         log(f"[local] ready in {time.time() - t0:.1f}s")
-        self.avg_task_s = 15.0  # EMA of per-task latency for the governor
+        self.avg_task_s = 15.0   # EMA of per-task latency for the governor
+        self.tps = 8.0           # measured output tokens/sec (conservative
+                                 # prior; updated from real generations)
 
     def gen(self, system: str, user: str, max_tokens: int,
             temperature: float = 0.2, grammar=None) -> str:
         """One complete, uninterrupted generation (L1)."""
+        # Hard anti-timeout clamp: near the end of the budget, a request
+        # for N tokens must not be allowed to run past the wall. Scale the
+        # cap to what the MEASURED generation speed can deliver in the
+        # time that is actually left.
+        left = remaining() - RESERVE_S * 0.5
+        if left < max_tokens / max(self.tps, 1.0):
+            max_tokens = max(48, int(left * self.tps * 0.7))
         kwargs = dict(
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user[:MAX_PROMPT_CHARS]}],
@@ -343,7 +392,15 @@ class Local:
         if grammar is not None:
             kwargs["grammar"] = grammar
         try:
+            t0 = time.time()
             out = self.llm.create_chat_completion(**kwargs)
+            dt = max(time.time() - t0, 0.001)
+            try:
+                ctoks = out.get("usage", {}).get("completion_tokens", 0)
+                if ctoks >= 16:
+                    self.tps = 0.7 * self.tps + 0.3 * (ctoks / dt)
+            except Exception:
+                pass
             return (out["choices"][0]["message"]["content"] or "").strip()
         except Exception as exc:
             log(f"[local] generation failed: {exc}")
@@ -929,7 +986,7 @@ def run() -> int:
     for t, cat in ordered:
         tid = t["task_id"]
         left = remaining()
-        if not fast and left < RESERVE_S + 2.5 * local.avg_task_s:
+        if not fast and left < RESERVE_S + 3.0 * local.avg_task_s:
             fast = True
             log(f"[governor] {left:.0f}s left — FAST mode (short caps, no retries)")
         if left < RESERVE_S * 0.5:

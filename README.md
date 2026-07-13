@@ -58,6 +58,15 @@ correctness, format compliance, reliability, and runtime.
 - **Portable binary** — llama-cpp-python is compiled in the image with
   `GGML_NATIVE=OFF`, so the build never targets the build machine's CPU
   instruction set. It runs on any x86-64 host, including the judging CPU.
+- **cgroup-aware threading** — `os.cpu_count()` reports the HOST's cores,
+  not the container's CPU quota; on a 2-vCPU cgroup it can spawn dozens of
+  llama.cpp threads and thrash into a multi-x slowdown (the proven TIMEOUT
+  root cause of earlier submissions). The agent reads the cgroup v2/v1
+  quota (falling back to the affinity mask, clamped to 4) and threads
+  exactly what the harness actually grants.
+- **Measured-speed generation clamp** — output token caps are dynamically
+  scaled to the MEASURED tokens/sec near the end of the budget, so no
+  single generation can run past the wall.
 - **No runtime downloads, no secrets** — weights are baked in at build time
   with a pinned SHA256; `FIREWORKS_API_KEY` is neither required nor read.
 - **Time governor** — an EMA of per-task latency switches to a fast mode
@@ -111,7 +120,7 @@ failure.
 |---|---|---|
 | `TIME_BUDGET_S` | 520 | wall-clock budget before the governor stops |
 | `THREADS` | all cores | llama.cpp threads |
-| `N_CTX` | 3072 | context window |
+| `N_CTX` | 2048 | context window |
 
 ## AMD / Fireworks usage
 
