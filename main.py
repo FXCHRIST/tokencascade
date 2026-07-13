@@ -134,8 +134,8 @@ ALL_CATEGORIES = [FACTUAL, MATH, SENTIMENT, SUMMARIZATION, NER,
 # purely to protect the runtime budget on a 2-vCPU CPU box. FAST values are
 # used when the time governor engages.
 CAP = {
-    FACTUAL: 220, SENTIMENT: 150, SUMMARIZATION: 260, NER: 300,
-    MATH: 300, LOGIC: 340, CODE_DEBUG: 460, CODE_GEN: 460,
+    FACTUAL: 180, SENTIMENT: 120, SUMMARIZATION: 260, NER: 300,
+    MATH: 260, LOGIC: 340, CODE_DEBUG: 460, CODE_GEN: 460,
 }
 CAP_FAST = {
     FACTUAL: 140, SENTIMENT: 90, SUMMARIZATION: 180, NER: 220,
@@ -726,9 +726,11 @@ def h_factual(prompt, local, fast):
     if not rv or rv[:2].upper() == "OK":
         return a, {"verified": "selfcheck-ok"}
     fixed = local.gen(
-        PROMPTS[FACTUAL] + " A reviewer identified this error in a previous "
-        f"answer: {rv[:200]} Write the corrected answer.",
-        prompt, cap, 0.2)
+        "Answer the question correctly and directly in 1-3 short "
+        "sentences. State only the corrected facts — no hedging, no "
+        "discussion of the error, no alternatives. A reviewer found this "
+        f"error in a previous answer: {rv[:200]}",
+        prompt, 140, 0.2)
     if fixed:
         return fixed, {"verified": "selfcheck-corrected"}
     return a, {"verified": "selfcheck-flagged-unfixed"}
@@ -756,22 +758,33 @@ def h_sentiment(prompt, local, fast):
     return a, {"verified": "label-surfaced"}
 
 
+FMT_DESC = {
+    "sentences": lambda c: f"EXACTLY {c[1]} sentences",
+    "bullets": lambda c: f"EXACTLY {c[1]} bullet points"
+               + (f", each at most {c[2]} words" if c[2] else ""),
+    "max_words": lambda c: f"AT MOST {c[1]} words",
+    "exact_words": lambda c: f"EXACTLY {c[1]} words",
+}
+
+
 def h_summarization(prompt, local, fast):
     constraint = parse_format_constraint(prompt)
     cap = (CAP_FAST if fast else CAP)[SUMMARIZATION]
-    a = local.gen(PROMPTS[SUMMARIZATION], prompt, cap, 0.2)
+    sys_prompt = PROMPTS[SUMMARIZATION]
+    if constraint:
+        sys_prompt += (" The summary MUST be "
+                       + FMT_DESC[constraint[0]](constraint)
+                       + " — count carefully before answering.")
+    a = local.gen(sys_prompt, prompt, cap, 0.2)
     if check_format(a, constraint):
         return a, {"verified": "format-ok"}
     if fast or remaining() < RESERVE_S + 20:
         return repair_format(a, constraint), {"verified": "format-repaired"}
     # Regenerate with the violated constraint restated explicitly.
-    desc = {"sentences": lambda c: f"EXACTLY {c[1]} sentences",
-            "bullets": lambda c: f"EXACTLY {c[1]} bullet points"
-                       + (f", each at most {c[2]} words" if c[2] else ""),
-            "max_words": lambda c: f"AT MOST {c[1]} words",
-            "exact_words": lambda c: f"EXACTLY {c[1]} words"}[constraint[0]](constraint)
+    desc = FMT_DESC[constraint[0]](constraint)
     retry = local.gen(
-        PROMPTS[SUMMARIZATION] + f" The summary MUST be {desc} — count before answering.",
+        PROMPTS[SUMMARIZATION] + f" Your previous attempt violated the "
+        f"format. The summary MUST be {desc} — count before answering.",
         prompt, cap, 0.3)
     if check_format(retry, constraint):
         return retry, {"verified": "format-ok-retry"}
@@ -805,9 +818,23 @@ def h_logic(prompt, local, fast):
     if a and "answer:" in a.lower():
         return a, {"verified": "answer-line"}
 
-    # Reasoning exists but no Answer line — almost always cap truncation
-    # (the hard-logic-1 failure mode). The deduction work is already done,
-    # so salvage it with a cheap conclude call instead of a full re-solve.
+    # Reasoning exists but no Answer line — cap truncation. Conclude can
+    # only EXTRACT an answer that already appears in the text; if the
+    # derivation was cut before reaching it, conclude guesses (observed:
+    # wrong seating order). So first CONTINUE the derivation to completion,
+    # then conclude only as a last resort.
+    if a and not fast and remaining() > RESERVE_S + 30:
+        cont = local.gen(
+            "You are finishing a logic-puzzle solution that was cut off. "
+            "Continue the reasoning from exactly where it stops — do not "
+            "restart or repeat it — and finish with a single final line in "
+            "exactly this form: 'Answer: <answer>'.",
+            prompt + "\n\nWork so far (continue from the end):\n" + a[-1600:],
+            220, 0.1)
+        if cont and "answer:" in cont.lower():
+            return a + "\n" + cont, {"verified": "continued"}
+        if cont:
+            a = a + "\n" + cont  # partial progress still helps conclude
     if a:
         conclude = local.gen(
             "You are given a logic puzzle and a partial line of reasoning "

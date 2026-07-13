@@ -132,6 +132,12 @@ class Llama:
                     "with output flat and sick days down, recommended "
                     "adopting it permanently.")
 
+        # --- logic continuation ---
+        if "finishing a logic-puzzle solution" in s:
+            return ("Continuing: since Jo has the dog and Sam cannot have "
+                    "the bird, Sam takes the cat and Lee the bird.\n"
+                    "Answer: Sam owns the cat")
+
         # --- logic conclude salvage ---
         if "reasoning" in s and "cut off" in s:
             return "Answer: Sam owns the cat"
@@ -151,7 +157,8 @@ class Llama:
             return "OK"
 
         # --- factual ---
-        if os.environ.get("SIM_FACT_WRONG") == "1" and "reviewer identified" not in s:
+        corrective = ("reviewer identified" in s) or ("reviewer found" in s)
+        if os.environ.get("SIM_FACT_WRONG") == "1" and not corrective:
             return ("The capital of Australia is Canberra, located near the "
                     "Tasman Sea.")
         return ("The capital of Australia is Canberra, located near Lake "

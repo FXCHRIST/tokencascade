@@ -192,8 +192,10 @@ check("S9 model-load failure: exit 0 + complete all-fallback file",
 # ---------------------------------------------------------------- S10
 r, results = run_agent({"SIM_LOGIC_TRUNCATED": "1"})
 logic_ans = by_id(results).get("practice-07", "")
-check("S10 truncated logic salvaged via conclude call",
-      "answer:" in logic_ans.lower() and "sam" in logic_ans.lower().split("answer:")[-1],
+check("S10 truncated logic finished via continuation (not a blind guess)",
+      "answer:" in logic_ans.lower()
+      and "sam" in logic_ans.lower().split("answer:")[-1]
+      and "continuing" in logic_ans.lower(),
       logic_ans[-50:])
 
 # ---------------------------------------------------------------- S11
